@@ -74,3 +74,10 @@ streamlit run DL.py
 ---
 **Author**: [개발자 이름/아이디를 입력하세요]
 **License**: MIT License (또는 적용할 라이선스)
+
+---
+
+## 📖 상세 업데이트 및 검증 가이드
+최신 업데이트 내역, 에러 수정 사항 및 시뮬레이션 검증 결과에 대한 상세 내용은 아래 문서를 참조하세요.
+
+👉 [상세 워크스루(Walkthrough) 바로가기](./docs/walkthrough.md)
