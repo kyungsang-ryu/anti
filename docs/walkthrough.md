@@ -39,3 +39,7 @@
 
 - 모든 구문 검사(`python -m py_compile`)를 통과했습니다.
 - 이제 `streamlit run DL.py` (또는 [DL/DL.py](file:///d:/%EC%9C%A0%EA%B2%BD%EC%83%81/anti/DL/DL.py)) 환경에서 개선된 속도와 하단 다운로드 버튼을 직접 확인하실 수 있습니다.
+
+
+수정 사항
+ - 시뮬레이션이 끝나고 엑셀을 다운로드 하면 화면이 초기화 되어버림
