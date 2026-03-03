@@ -2,8 +2,8 @@ import streamlit as st
 import pandapower as pp
 import pandas as pd
 import numpy as np
-import re
 import plotly.express as px
+import io
 
 st.set_page_config(page_title="협조 제어 동적 시뮬레이터", layout="wide")
 
@@ -69,7 +69,7 @@ bus_data = {
     "ESS_용량": [0.0, 0.0, 0.0, 5.0, 15.0]
 }
 df_bus = pd.DataFrame(bus_data)
-edited_df_bus = st.data_editor(df_bus, hide_index=True, use_container_width=True)
+edited_df_bus = st.data_editor(df_bus, hide_index=True, width='stretch')
 
 st.subheader("네트워크 구성도 (Topology)")
 def get_components(idx):
@@ -124,7 +124,7 @@ else:
     }
     df_time = pd.DataFrame(time_data)
 
-edited_df_time = st.data_editor(df_time, num_rows="dynamic", hide_index=True, use_container_width=True)
+edited_df_time = st.data_editor(df_time, num_rows="dynamic", hide_index=True, width='stretch')
 
 
 # ==========================================
@@ -213,7 +213,7 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
             
         # 2. 예비 조류해석 (ESS 개입 전 확인)
         try:
-            pp.runpp(net, numba=False)
+            pp.runpp(net, numba=True)
         except:
             # 수렴 실패 시 이전 상태가 없을 수 있으므로 초기값 보장
             if minute == 0:
@@ -243,7 +243,7 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
         
         # 4. ESS 개입 후 최종 조류해석
         try:
-            pp.runpp(net, numba=False)
+            pp.runpp(net, numba=True)
         except:
             if minute == 0:
                 net.res_bus = pd.DataFrame(1.0, index=net.bus.index, columns=["vm_pu", "va_degree"])
@@ -297,13 +297,13 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
         fig_v = px.line(df_v, labels={'index': '시간', 'value': 'Voltage (p.u.)', 'variable': '모선'})
         # Y축 0.7 ~ 1.2 고정 및 마우스 오버 시 전체 모선 데이터 표시
         fig_v.update_layout(yaxis_range=[0.7, 1.2], margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_v, use_container_width=True)
+        st.plotly_chart(fig_v, width='stretch')
         
         st.markdown("##### ⚙️ 변전소 OLTC 탭 변화")
         df_tap = pd.DataFrame({"OLTC Tap": history_tap}, index=time_index)
         fig_tap = px.line(df_tap, labels={'index': '시간', 'value': 'Tap Position'})
         fig_tap.update_layout(margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_tap, use_container_width=True)
+        st.plotly_chart(fig_tap, width='stretch')
 
     with col2:
         st.markdown("##### 🔋 ESS SOC (%)")
@@ -311,10 +311,33 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
         fig_soc = px.line(df_soc, labels={'index': '시간', 'value': 'SOC (%)', 'variable': '모선'})
         # SOC는 0~100% 구간으로 고정
         fig_soc.update_layout(yaxis_range=[0, 100], margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_soc, use_container_width=True)
+        st.plotly_chart(fig_soc, width='stretch')
         
         st.markdown("##### ⚡ ESS 실시간 충방전 출력 (MW)")
         df_ess_p = pd.DataFrame(history_ess_p, index=time_index)
         fig_ess_p = px.line(df_ess_p, labels={'index': '시간', 'value': 'ESS 출력 (MW)', 'variable': '모선'})
         fig_ess_p.update_layout(margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_ess_p, use_container_width=True)
+        st.plotly_chart(fig_ess_p, width='stretch')
+
+    # ==========================================
+    # 5. 엑셀 다운로드 (BytesIO 메모리 버퍼 활용)
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📥 시뮬레이션 결과 다운로드")
+    
+    # 엑셀 파일 생성을 위한 메모리 버퍼
+    buffer = io.BytesIO()
+    
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        df_v.to_excel(writer, sheet_name='Voltage_PU')
+        df_tap.to_excel(writer, sheet_name='OLTC_Tap')
+        df_soc.to_excel(writer, sheet_name='ESS_SOC')
+        df_ess_p.to_excel(writer, sheet_name='ESS_Power_MW')
+        
+    st.download_button(
+        label="📊 결과를 엑셀 파일로 저장 (.xlsx)",
+        data=buffer.getvalue(),
+        file_name="simulation_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary"
+    )
