@@ -81,3 +81,9 @@ streamlit run DL.py
 최신 업데이트 내역, 에러 수정 사항 및 시뮬레이션 검증 결과에 대한 상세 내용은 아래 문서를 참조하세요.
 
 👉 [상세 워크스루(Walkthrough) 바로가기](./docs/walkthrough.md)
+
+---
+##  최신 업데이트 (2026-03-04)
+- IDE 직접 실행 시 Streamlit 자동 전환 로직 및 Numba 가속 모드 적용
+- 시뮬레이션 결과 엑셀(.xlsx) 추출 기능 구현
+👉 상세 내역 및 에러 수정 사항은 [워크스루 문서](./docs/walkthrough.md)에서 확인하세요.

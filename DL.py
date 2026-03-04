@@ -5,6 +5,13 @@ import numpy as np
 import plotly.express as px
 import io
 
+# Numba 설치 여부 확인 (Python 3.14+ 환경 대응)
+try:
+    import numba
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 st.set_page_config(page_title="협조 제어 동적 시뮬레이터", layout="wide")
 
 st.title("⚡ 24시간 동적 시뮬레이션: OLTC & ESS 협조 제어")
@@ -160,7 +167,64 @@ def create_dynamic_network():
         
     return net
 
-if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
+# ==========================================
+# 4. 시뮬레이션 결과 표시 함수 (Session State 연동)
+# ==========================================
+def display_results():
+    if "sim_results" not in st.session_state:
+        return
+
+    results = st.session_state["sim_results"]
+    df_v = results["df_v"]
+    df_tap = results["df_tap"]
+    df_soc = results["df_soc"]
+    df_ess_p = results["df_ess_p"]
+    time_index = results["time_index"]
+
+    st.header("2. 24시간 협조 제어 시뮬레이션 결과")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("##### 📉 모선별 24시간 전압 프로파일 (p.u.)")
+        fig_v = px.line(df_v, labels={'index': '시간', 'value': 'Voltage (p.u.)', 'variable': '모선'})
+        fig_v.update_layout(yaxis_range=[0.7, 1.2], margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
+        st.plotly_chart(fig_v, key="fig_v_chart")
+        
+        st.markdown("##### ⚙️ 변전소 OLTC 탭 변화")
+        fig_tap = px.line(df_tap, labels={'index': '시간', 'value': 'Tap Position'})
+        fig_tap.update_layout(margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
+        st.plotly_chart(fig_tap, key="fig_tap_chart")
+
+    with col2:
+        st.markdown("##### 🔋 ESS SOC (%)")
+        fig_soc = px.line(df_soc, labels={'index': '시간', 'value': 'SOC (%)', 'variable': '모선'})
+        fig_soc.update_layout(yaxis_range=[0, 100], margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
+        st.plotly_chart(fig_soc, key="fig_soc_chart")
+        
+        st.markdown("##### ⚡ ESS 실시간 충방전 출력 (MW)")
+        fig_ess_p = px.line(df_ess_p, labels={'index': '시간', 'value': 'ESS 출력 (MW)', 'variable': '모선'})
+        fig_ess_p.update_layout(margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
+        st.plotly_chart(fig_ess_p, key="fig_ess_p_chart")
+
+    st.markdown("---")
+    st.subheader("� 시뮬레이션 결과 다운로드")
+    
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        df_v.to_excel(writer, sheet_name='Voltage_PU')
+        df_tap.to_excel(writer, sheet_name='OLTC_Tap')
+        df_soc.to_excel(writer, sheet_name='ESS_SOC')
+        df_ess_p.to_excel(writer, sheet_name='ESS_Power_MW')
+        
+    st.download_button(
+        label="📊 결과를 엑셀 파일로 저장 (.xlsx)",
+        data=buffer.getvalue(),
+        file_name="simulation_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary"
+    )
+
+if st.button("�🚀 24시간 동적 시뮬레이션 시작", type="primary"):
     # 24시간 = 1440분
     total_minutes = 24 * 60
     
@@ -213,7 +277,7 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
             
         # 2. 예비 조류해석 (ESS 개입 전 확인)
         try:
-            pp.runpp(net, numba=True)
+            pp.runpp(net, numba=HAS_NUMBA)
         except:
             # 수렴 실패 시 이전 상태가 없을 수 있으므로 초기값 보장
             if minute == 0:
@@ -243,7 +307,7 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
         
         # 4. ESS 개입 후 최종 조류해석
         try:
-            pp.runpp(net, numba=True)
+            pp.runpp(net, numba=HAS_NUMBA)
         except:
             if minute == 0:
                 net.res_bus = pd.DataFrame(1.0, index=net.bus.index, columns=["vm_pu", "va_degree"])
@@ -280,64 +344,31 @@ if st.button("🚀 24시간 동적 시뮬레이션 시작", type="primary"):
             history_v[f"Bus {i+1}"].append(net.res_bus.vm_pu.at[idx])
         history_tap.append(current_tap)
 
-    progress_bar.progress(1.0, text="시뮬레이션 완료!")
-
-    # ==========================================
-    # 4. 결과 시각화
-    # ==========================================
-    st.header("2. 24시간 협조 제어 시뮬레이션 결과")
-    
-    # x축 시간 레이블 생성 (00:00 ~ 24:00)
+    # 시뮬레이션 종료 후 결과 정리 및 세션 저장
     time_index = [f"{m//60:02d}:{m%60:02d}" for m in range(total_minutes + 1)]
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("##### 📉 모선별 24시간 전압 프로파일 (p.u.)")
-        df_v = pd.DataFrame(history_v, index=time_index)
-        fig_v = px.line(df_v, labels={'index': '시간', 'value': 'Voltage (p.u.)', 'variable': '모선'})
-        # Y축 0.7 ~ 1.2 고정 및 마우스 오버 시 전체 모선 데이터 표시
-        fig_v.update_layout(yaxis_range=[0.7, 1.2], margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_v, width='stretch')
-        
-        st.markdown("##### ⚙️ 변전소 OLTC 탭 변화")
-        df_tap = pd.DataFrame({"OLTC Tap": history_tap}, index=time_index)
-        fig_tap = px.line(df_tap, labels={'index': '시간', 'value': 'Tap Position'})
-        fig_tap.update_layout(margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_tap, width='stretch')
+    st.session_state["sim_results"] = {
+        "df_v": pd.DataFrame(history_v, index=time_index),
+        "df_tap": pd.DataFrame({"OLTC Tap": history_tap}, index=time_index),
+        "df_soc": pd.DataFrame(history_soc, index=time_index),
+        "df_ess_p": pd.DataFrame(history_ess_p, index=time_index),
+        "time_index": time_index
+    }
 
-    with col2:
-        st.markdown("##### 🔋 ESS SOC (%)")
-        df_soc = pd.DataFrame(history_soc, index=time_index)
-        fig_soc = px.line(df_soc, labels={'index': '시간', 'value': 'SOC (%)', 'variable': '모선'})
-        # SOC는 0~100% 구간으로 고정
-        fig_soc.update_layout(yaxis_range=[0, 100], margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_soc, width='stretch')
-        
-        st.markdown("##### ⚡ ESS 실시간 충방전 출력 (MW)")
-        df_ess_p = pd.DataFrame(history_ess_p, index=time_index)
-        fig_ess_p = px.line(df_ess_p, labels={'index': '시간', 'value': 'ESS 출력 (MW)', 'variable': '모선'})
-        fig_ess_p.update_layout(margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified")
-        st.plotly_chart(fig_ess_p, width='stretch')
+    progress_bar.progress(1.0, text="시뮬레이션 완료!")
+    st.rerun()
 
-    # ==========================================
-    # 5. 엑셀 다운로드 (BytesIO 메모리 버퍼 활용)
-    # ==========================================
-    st.markdown("---")
-    st.subheader("📥 시뮬레이션 결과 다운로드")
-    
-    # 엑셀 파일 생성을 위한 메모리 버퍼
-    buffer = io.BytesIO()
-    
-    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        df_v.to_excel(writer, sheet_name='Voltage_PU')
-        df_tap.to_excel(writer, sheet_name='OLTC_Tap')
-        df_soc.to_excel(writer, sheet_name='ESS_SOC')
-        df_ess_p.to_excel(writer, sheet_name='ESS_Power_MW')
-        
-    st.download_button(
-        label="📊 결과를 엑셀 파일로 저장 (.xlsx)",
-        data=buffer.getvalue(),
-        file_name="simulation_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary"
-    )
+# 항상 결과 표시 (세션에 있을 경우)
+display_results()
+
+# ==========================================
+# 6. 직접 실행 시 Streamlit 자동 구동 (IDE 버튼 대응)
+# ==========================================
+if __name__ == "__main__":
+    import sys
+    import subprocess
+    from streamlit import runtime
+
+    # Streamlit 런타임이 실행 중인지 확인하여 무한 반복 방지
+    if not runtime.exists():
+        print("🚀 Streamlit 모드로 전환하여 실행합니다...")
+        subprocess.run([sys.executable, "-m", "streamlit", "run", sys.argv[0]])
