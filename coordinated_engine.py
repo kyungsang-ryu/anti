@@ -40,12 +40,46 @@ SCENARIO_LOAD_INCREASE = "load_increase"
 SCENARIO_RENEWABLE_INCREASE = "renewable_increase"
 SCENARIO_BOTH_INCREASE = "both_increase"
 SCENARIO_RENEWABLE_BY_LOAD_LEVEL = "renewable_by_load_level"
+SCENARIO_MODE_HOSTING_CAPACITY = "hosting_capacity"
+SCENARIO_MODE_LOAD_PV_MAP = "load_pv_map"
+SCENARIO_MODE_ESS_SIZING = "ess_sizing"
 LOAD_LEVEL_COL = "부하구간"
 
 STATE_NORMAL = "NORMAL"
 STATE_UNDERVOLTAGE = "UNDERVOLTAGE"
 STATE_OVERVOLTAGE = "OVERVOLTAGE"
 STATE_CONGESTION = "CONGESTION"
+
+CONTROL_CASE_NO_CONTROL = "no_control"
+CONTROL_CASE_OLTC_ONLY = "oltc_only"
+CONTROL_CASE_OLTC_ESS = "oltc_ess"
+
+SCENARIO_MODE_METADATA: dict[str, dict[str, Any]] = {
+    SCENARIO_MODE_HOSTING_CAPACITY: {
+        "label": "Hosting Capacity",
+        "research_question": "Determine the PV hosting limit under fixed load, ESS, and control assumptions.",
+        "fixed_variables": "Load_growth, ESS_size, ESS_location, control_case",
+        "varied_variables": "PV_penetration",
+    },
+    SCENARIO_MODE_LOAD_PV_MAP: {
+        "label": "Load-PV Map",
+        "research_question": "Build a 2D operating map over joint load and PV stress.",
+        "fixed_variables": "ESS_size, ESS_location, control_case",
+        "varied_variables": "Load_growth, PV_penetration",
+    },
+    SCENARIO_MODE_ESS_SIZING: {
+        "label": "ESS Sizing",
+        "research_question": "Evaluate ESS size and placement under a fixed representative stress case.",
+        "fixed_variables": "Load_growth, PV_penetration, control_case",
+        "varied_variables": "ESS_size, ESS_location",
+    },
+}
+
+CONTROL_CASE_LABELS = {
+    CONTROL_CASE_NO_CONTROL: "No control",
+    CONTROL_CASE_OLTC_ONLY: "OLTC only",
+    CONTROL_CASE_OLTC_ESS: "OLTC + ESS",
+}
 
 
 def scenario_label(scenario: str) -> str:
@@ -79,6 +113,7 @@ def advanced_config(config: Dict[str, float]) -> Dict[str, float]:
     merged.setdefault("ess_bus_number", 5)
     merged.setdefault("ess_power_mw", 5.0)
     merged.setdefault("ess_capacity_mwh", 15.0)
+    merged.setdefault("control_case", CONTROL_CASE_OLTC_ESS)
     return merged
 
 
@@ -253,6 +288,33 @@ def build_analysis_excel_bytes(sim_results: Dict[str, pd.DataFrame]) -> bytes:
 
 
 
+def control_case_label(control_case: str) -> str:
+    return CONTROL_CASE_LABELS.get(str(control_case), str(control_case))
+
+
+def scenario_mode_label(mode: str) -> str:
+    meta = SCENARIO_MODE_METADATA.get(str(mode), {})
+    return str(meta.get("label", mode))
+
+
+def scenario_mode_metadata(mode: str) -> Dict[str, Any]:
+    mode_key = str(mode)
+    if mode_key not in SCENARIO_MODE_METADATA:
+        supported = ", ".join(SCENARIO_MODE_METADATA)
+        raise ValueError(f"Unsupported scenario mode '{mode_key}'. Supported modes: {supported}")
+    meta = dict(SCENARIO_MODE_METADATA[mode_key])
+    meta["mode"] = mode_key
+    return meta
+
+
+def supported_scenario_modes() -> list[str]:
+    return list(SCENARIO_MODE_METADATA.keys())
+
+
+def supported_control_cases() -> list[str]:
+    return list(CONTROL_CASE_LABELS.keys())
+
+
 def _stable_float_list(values: list[float]) -> list[float]:
     ordered: list[float] = []
     seen: set[float] = set()
@@ -264,8 +326,29 @@ def _stable_float_list(values: list[float]) -> list[float]:
     return ordered
 
 
+def _stable_int_list(values: list[int]) -> list[int]:
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        item = int(value)
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def _stable_text_list(values: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            ordered.append(text)
+    return ordered
+
+
 def _expand_scenario_values(spec: Any, default: list[float]) -> list[float]:
-    """Expand a scalar, list, comma-separated string, or range dict into float values."""
     if spec is None:
         return list(default)
     if isinstance(spec, dict):
@@ -300,53 +383,400 @@ def _expand_scenario_values(spec: Any, default: list[float]) -> list[float]:
     return [float(spec)]
 
 
-def generate_scenarios(settings: Dict[str, Any]) -> list[Dict[str, Any]]:
-    """Create a Cartesian batch of PV, ESS, and load-growth scenarios with stable IDs."""
-    pv_values = _expand_scenario_values(settings.get("pv_penetration", settings.get("PV_penetration", settings.get("pv_penetration_values"))), [1.0])
-    ess_values = _expand_scenario_values(settings.get("ess_size", settings.get("ESS_size", settings.get("ess_size_values"))), [1.0])
-    load_values = _expand_scenario_values(settings.get("load_growth", settings.get("Load_growth", settings.get("load_growth_values"))), [1.0])
+def _expand_text_values(spec: Any, default: list[str]) -> list[str]:
+    if spec is None:
+        return list(default)
+    if isinstance(spec, str):
+        text = spec.strip()
+        if not text:
+            return list(default)
+        return _stable_text_list([part.strip() for part in text.split(",") if part.strip()])
+    if isinstance(spec, (list, tuple, set, np.ndarray, pd.Series)):
+        return _stable_text_list([str(x).strip() for x in spec])
+    return [str(spec).strip()]
 
-    for value in pv_values + ess_values:
-        if value < 0.0:
-            raise ValueError("PV penetration and ESS size must be >= 0")
-    for value in load_values:
-        if value <= 0.0:
-            raise ValueError("Load growth must be > 0")
 
-    scenarios: list[Dict[str, Any]] = []
-    index = 1
-    for pv_penetration, ess_size, load_growth in product(pv_values, ess_values, load_values):
-        scenarios.append(
+def _expand_control_cases(spec: Any, default: list[str]) -> list[str]:
+    values = _expand_text_values(spec, default)
+    normalized: list[str] = []
+    for value in values:
+        key = str(value).strip().lower()
+        if key not in CONTROL_CASE_LABELS:
+            supported = ", ".join(CONTROL_CASE_LABELS)
+            raise ValueError(f"Unsupported control_case '{value}'. Supported control cases: {supported}")
+        normalized.append(key)
+    return _stable_text_list(normalized)
+
+
+def _expand_location_values(spec: Any, default: list[int]) -> list[int]:
+    values = _expand_scenario_values(spec, [float(v) for v in default])
+    locations: list[int] = []
+    for value in values:
+        rounded = int(round(float(value)))
+        if abs(float(value) - rounded) > 1e-9:
+            raise ValueError("ESS_location must be an integer bus number")
+        if rounded < 1 or rounded > BUS_COUNT:
+            raise ValueError(f"ESS_location must be between 1 and {BUS_COUNT}")
+        locations.append(rounded)
+    return _stable_int_list(locations)
+
+
+def _require_single_value(values: list[Any], field_name: str, mode: str) -> Any:
+    if len(values) != 1:
+        raise ValueError(f"{scenario_mode_label(mode)} requires a fixed {field_name}, not multiple values")
+    return values[0]
+
+
+def _normalized_execution_key(scenario: Dict[str, Any]) -> tuple[Any, ...]:
+    control_case = str(scenario.get("control_case", CONTROL_CASE_OLTC_ESS))
+    ess_size = round(float(scenario.get("ESS_size", 0.0)), 10)
+    ess_location = int(scenario.get("ESS_location", 0) or 0)
+    if control_case != CONTROL_CASE_OLTC_ESS or ess_size <= 0.0:
+        ess_size = 0.0
+        ess_location = 0
+    return (
+        str(scenario.get("mode", "")),
+        control_case,
+        round(float(scenario.get("PV_penetration", 1.0)), 10),
+        round(float(scenario.get("Load_growth", 1.0)), 10),
+        ess_size,
+        ess_location,
+        str(scenario.get("base_stress_case", "")),
+    )
+
+
+def _scenario_label_text(mode: str, pv_penetration: float, load_growth: float, ess_size: float, ess_location: int, control_case: str) -> str:
+    control_text = control_case_label(control_case)
+    if mode == SCENARIO_MODE_HOSTING_CAPACITY:
+        return f"HC | PV {pv_penetration:.2f} | Load {load_growth:.2f} | {control_text}"
+    if mode == SCENARIO_MODE_LOAD_PV_MAP:
+        return f"MAP | Load {load_growth:.2f} | PV {pv_penetration:.2f} | {control_text}"
+    return f"ESS | Size {ess_size:.2f} | Bus {ess_location} | PV {pv_penetration:.2f} | Load {load_growth:.2f}"
+
+
+def _scenario_description_text(mode: str, pv_penetration: float, load_growth: float, ess_size: float, ess_location: int, control_case: str, base_stress_case: str) -> str:
+    control_text = control_case_label(control_case)
+    if mode == SCENARIO_MODE_HOSTING_CAPACITY:
+        return f"Hosting-capacity sweep with PV={pv_penetration:.2f}, load={load_growth:.2f}, control={control_text}."
+    if mode == SCENARIO_MODE_LOAD_PV_MAP:
+        return f"Operating-map point with load={load_growth:.2f}, PV={pv_penetration:.2f}, control={control_text}."
+    return f"ESS sizing case at Bus {ess_location} with size={ess_size:.2f} under {base_stress_case}."
+
+
+def _make_scenario_dict(
+    mode: str,
+    pv_penetration: float,
+    load_growth: float,
+    ess_size: float,
+    ess_location: int,
+    control_case: str,
+    base_stress_case: str = "",
+) -> Dict[str, Any]:
+    meta = scenario_mode_metadata(mode)
+    scenario = {
+        "mode": mode,
+        "mode_label": meta["label"],
+        "research_question": meta["research_question"],
+        "PV_penetration": float(pv_penetration),
+        "Load_growth": float(load_growth),
+        "ESS_size": max(0.0, float(ess_size)),
+        "ESS_location": int(ess_location),
+        "control_case": str(control_case),
+        "control_case_label": control_case_label(str(control_case)),
+        "base_stress_case": str(base_stress_case),
+    }
+    scenario["scenario_label"] = _scenario_label_text(
+        mode=mode,
+        pv_penetration=float(scenario["PV_penetration"]),
+        load_growth=float(scenario["Load_growth"]),
+        ess_size=float(scenario["ESS_size"]),
+        ess_location=int(scenario["ESS_location"]),
+        control_case=str(scenario["control_case"]),
+    )
+    scenario["scenario_description"] = _scenario_description_text(
+        mode=mode,
+        pv_penetration=float(scenario["PV_penetration"]),
+        load_growth=float(scenario["Load_growth"]),
+        ess_size=float(scenario["ESS_size"]),
+        ess_location=int(scenario["ESS_location"]),
+        control_case=str(scenario["control_case"]),
+        base_stress_case=str(scenario["base_stress_case"]),
+    )
+    return scenario
+
+
+def _finalize_generated_scenarios(mode: str, scenarios: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    filtered: list[Dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scenario in scenarios:
+        key = _normalized_execution_key(scenario)
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(scenario)
+    if not filtered:
+        raise ValueError(f"{scenario_mode_label(mode)} did not produce any valid scenarios")
+    for index, scenario in enumerate(filtered, start=1):
+        scenario["scenario_id"] = f"SCN_{index:03d}"
+    return filtered
+
+
+def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
+    if settings is None:
+        if not isinstance(mode, dict):
+            raise ValueError("generate_scenarios requires either (mode, settings) or a settings dict containing 'mode'")
+        settings = dict(mode)
+        mode = settings.get("mode", SCENARIO_MODE_HOSTING_CAPACITY)
+    settings = dict(settings or {})
+    mode_key = str(mode or settings.get("mode", SCENARIO_MODE_HOSTING_CAPACITY))
+    default_location = int(settings.get("default_ess_location", BUS_COUNT))
+
+    if mode_key == SCENARIO_MODE_HOSTING_CAPACITY:
+        pv_values = sorted(_expand_scenario_values(settings.get("pv_penetration", settings.get("PV_penetration")), [1.0]))
+        if len(pv_values) < 2:
+            raise ValueError("hosting_capacity requires at least two PV penetration values")
+        if any(value < 0.0 for value in pv_values):
+            raise ValueError("PV_penetration must be >= 0")
+        load_growth = float(_require_single_value(_expand_scenario_values(settings.get("load_growth", 1.0), [1.0]), "Load_growth", mode_key))
+        ess_size = float(_require_single_value(_expand_scenario_values(settings.get("ess_size", settings.get("ESS_size", 1.0)), [1.0]), "ESS_size", mode_key))
+        if load_growth <= 0.0:
+            raise ValueError("Load_growth must be > 0")
+        if ess_size < 0.0:
+            raise ValueError("ESS_size must be >= 0")
+        ess_location = int(_require_single_value(_expand_location_values(settings.get("ess_location", default_location), [default_location]), "ESS_location", mode_key))
+        control_cases = _expand_control_cases(settings.get("control_case", CONTROL_CASE_OLTC_ESS), [CONTROL_CASE_OLTC_ESS])
+        scenarios = []
+        for control_case in control_cases:
+            effective_ess_size = ess_size if control_case == CONTROL_CASE_OLTC_ESS else 0.0
+            for pv_penetration in pv_values:
+                scenarios.append(
+                    _make_scenario_dict(
+                        mode=mode_key,
+                        pv_penetration=float(pv_penetration),
+                        load_growth=load_growth,
+                        ess_size=effective_ess_size,
+                        ess_location=ess_location,
+                        control_case=control_case,
+                    )
+                )
+        return _finalize_generated_scenarios(mode_key, scenarios)
+
+    if mode_key == SCENARIO_MODE_LOAD_PV_MAP:
+        pv_values = sorted(_expand_scenario_values(settings.get("pv_penetration", settings.get("PV_penetration")), [1.0]))
+        load_values = sorted(_expand_scenario_values(settings.get("load_growth", settings.get("Load_growth")), [1.0]))
+        if len(pv_values) < 2 or len(load_values) < 2:
+            raise ValueError("load_pv_map requires at least two PV values and two load values")
+        if any(value < 0.0 for value in pv_values):
+            raise ValueError("PV_penetration must be >= 0")
+        if any(value <= 0.0 for value in load_values):
+            raise ValueError("Load_growth must be > 0")
+        ess_size = float(_require_single_value(_expand_scenario_values(settings.get("ess_size", settings.get("ESS_size", 1.0)), [1.0]), "ESS_size", mode_key))
+        if ess_size < 0.0:
+            raise ValueError("ESS_size must be >= 0")
+        ess_location = int(_require_single_value(_expand_location_values(settings.get("ess_location", default_location), [default_location]), "ESS_location", mode_key))
+        control_case = str(_require_single_value(_expand_control_cases(settings.get("control_case", CONTROL_CASE_OLTC_ESS), [CONTROL_CASE_OLTC_ESS]), "control_case", mode_key))
+        effective_ess_size = ess_size if control_case == CONTROL_CASE_OLTC_ESS else 0.0
+        scenarios = []
+        for load_growth, pv_penetration in product(load_values, pv_values):
+            scenarios.append(
+                _make_scenario_dict(
+                    mode=mode_key,
+                    pv_penetration=float(pv_penetration),
+                    load_growth=float(load_growth),
+                    ess_size=effective_ess_size,
+                    ess_location=ess_location,
+                    control_case=control_case,
+                )
+            )
+        return _finalize_generated_scenarios(mode_key, scenarios)
+
+    if mode_key == SCENARIO_MODE_ESS_SIZING:
+        base_pv_penetration = float(_require_single_value(_expand_scenario_values(settings.get("base_pv_penetration", settings.get("pv_penetration", 1.0)), [1.0]), "PV_penetration", mode_key))
+        base_load_growth = float(_require_single_value(_expand_scenario_values(settings.get("base_load_growth", settings.get("load_growth", 1.0)), [1.0]), "Load_growth", mode_key))
+        ess_sizes = sorted(_expand_scenario_values(settings.get("ess_size", settings.get("ESS_size", [0.0, 1.0])), [0.0, 1.0]))
+        ess_locations = _expand_location_values(settings.get("ess_location", default_location), [default_location])
+        if base_pv_penetration < 0.0:
+            raise ValueError("PV_penetration must be >= 0")
+        if base_load_growth <= 0.0:
+            raise ValueError("Load_growth must be > 0")
+        if any(value < 0.0 for value in ess_sizes):
+            raise ValueError("ESS_size must be >= 0")
+        base_ess_power_mw = float(settings.get("base_ess_power_mw", 0.0))
+        base_ess_capacity_mwh = float(settings.get("base_ess_capacity_mwh", 0.0))
+        if base_ess_power_mw <= 0.0 or base_ess_capacity_mwh <= 0.0:
+            raise ValueError("ess_sizing requires a positive base ESS rating in the current configuration")
+        control_case = str(_require_single_value(_expand_control_cases(settings.get("control_case", CONTROL_CASE_OLTC_ESS), [CONTROL_CASE_OLTC_ESS]), "control_case", mode_key))
+        if control_case != CONTROL_CASE_OLTC_ESS:
+            raise ValueError("ess_sizing requires control_case='oltc_ess' because ESS effectiveness is the study target")
+        base_stress_case = str(settings.get("base_stress_case") or f"PV {base_pv_penetration:.2f}, Load {base_load_growth:.2f}")
+        scenarios = []
+        for ess_size, ess_location in product(ess_sizes, ess_locations):
+            scenarios.append(
+                _make_scenario_dict(
+                    mode=mode_key,
+                    pv_penetration=base_pv_penetration,
+                    load_growth=base_load_growth,
+                    ess_size=float(ess_size),
+                    ess_location=int(ess_location),
+                    control_case=control_case,
+                    base_stress_case=base_stress_case,
+                )
+            )
+        finalized = _finalize_generated_scenarios(mode_key, scenarios)
+        if len(finalized) < 2:
+            raise ValueError("ess_sizing requires at least two distinct ESS size/location scenarios")
+        return finalized
+
+    supported = ", ".join(SCENARIO_MODE_METADATA)
+    raise ValueError(f"Unsupported scenario mode '{mode_key}'. Supported modes: {supported}")
+
+
+def build_scenario_preview_df(scenarios: list[Dict[str, Any]]) -> pd.DataFrame:
+    if not scenarios:
+        return pd.DataFrame()
+    rows = []
+    for scenario in scenarios:
+        rows.append(
             {
-                "scenario_id": f"SCN_{index:03d}",
-                "PV_penetration": float(pv_penetration),
-                "ESS_size": float(ess_size),
-                "Load_growth": float(load_growth),
+                "scenario_id": str(scenario.get("scenario_id", "")),
+                "mode": str(scenario.get("mode_label", scenario.get("mode", ""))),
+                "control_case": str(scenario.get("control_case_label", scenario.get("control_case", ""))),
+                "PV_penetration": float(scenario.get("PV_penetration", np.nan)),
+                "Load_growth": float(scenario.get("Load_growth", np.nan)),
+                "ESS_size": float(scenario.get("ESS_size", np.nan)),
+                "ESS_location": int(scenario.get("ESS_location", 0) or 0),
+                "base_stress_case": str(scenario.get("base_stress_case", "")),
+                "scenario_label": str(scenario.get("scenario_label", "")),
             }
         )
-        index += 1
-    return scenarios
+    preview_df = pd.DataFrame(rows)
+    if "base_stress_case" in preview_df.columns and preview_df["base_stress_case"].eq("").all():
+        preview_df = preview_df.drop(columns=["base_stress_case"])
+    return preview_df
 
+
+
+def _scenario_workflow_example_cases(config: Optional[Dict[str, float]] = None) -> Dict[str, list[Dict[str, Any]]]:
+    cfg = advanced_config(config or {})
+    default_location = int(cfg.get("ess_bus_number", BUS_COUNT))
+    example_power = max(float(cfg.get("ess_power_mw", 0.0)), 5.0)
+    example_capacity = max(float(cfg.get("ess_capacity_mwh", 0.0)), 15.0)
+    shared = {
+        "default_ess_location": default_location,
+        "base_ess_power_mw": example_power,
+        "base_ess_capacity_mwh": example_capacity,
+    }
+    return {
+        SCENARIO_MODE_HOSTING_CAPACITY: generate_scenarios(
+            SCENARIO_MODE_HOSTING_CAPACITY,
+            {
+                **shared,
+                "pv_penetration": [0.8, 1.0, 1.2],
+                "load_growth": 1.0,
+                "ess_size": 1.0,
+                "ess_location": default_location,
+                "control_case": CONTROL_CASE_OLTC_ESS,
+            },
+        ),
+        SCENARIO_MODE_LOAD_PV_MAP: generate_scenarios(
+            SCENARIO_MODE_LOAD_PV_MAP,
+            {
+                **shared,
+                "pv_penetration": [0.8, 1.2],
+                "load_growth": [0.9, 1.1],
+                "ess_size": 1.0,
+                "ess_location": default_location,
+                "control_case": CONTROL_CASE_OLTC_ESS,
+            },
+        ),
+        SCENARIO_MODE_ESS_SIZING: generate_scenarios(
+            SCENARIO_MODE_ESS_SIZING,
+            {
+                **shared,
+                "base_pv_penetration": 1.6,
+                "base_load_growth": 1.0,
+                "ess_size": [0.0, 0.5, 1.0],
+                "ess_location": default_location,
+                "control_case": CONTROL_CASE_OLTC_ESS,
+                "base_stress_case": "PV 1.60, Load 1.00",
+            },
+        ),
+    }
+
+
+def _scenario_flow_example_text(mode: str, scenarios: list[Dict[str, Any]]) -> str:
+    if not scenarios:
+        return "-"
+    if mode == SCENARIO_MODE_HOSTING_CAPACITY:
+        return " -> ".join(
+            [f"{item['scenario_id']} PV {float(item['PV_penetration']):.2f}" for item in scenarios[:3]]
+        )
+    if mode == SCENARIO_MODE_LOAD_PV_MAP:
+        return ", ".join(
+            [
+                f"{item['scenario_id']} Load {float(item['Load_growth']):.2f} / PV {float(item['PV_penetration']):.2f}"
+                for item in scenarios[:4]
+            ]
+        )
+    return " -> ".join(
+        [f"{item['scenario_id']} Size {float(item['ESS_size']):.2f} / Bus {int(item['ESS_location'])}" for item in scenarios[:3]]
+    )
+
+
+def scenario_workflow_lines(config: Optional[Dict[str, float]] = None) -> list[str]:
+    examples = _scenario_workflow_example_cases(config)
+    return [
+        "연구형 배치 시나리오는 무작위 조합이 아니라 연구 질문별 mode로 생성합니다.",
+        "공통 흐름: 기준 설정 확정 -> mode별 가변 변수 선택 -> 유효성 검사 및 중복 제거 -> SCN 번호 부여 -> 미리보기 -> 시나리오별 독립 실행 -> 요약 집계",
+        "hosting_capacity: 부하, ESS, 제어 조건을 고정한 뒤 PV를 단조 증가시켜 수용 한계와 첫 위반 시점을 찾습니다.",
+        f"예시 진행: {_scenario_flow_example_text(SCENARIO_MODE_HOSTING_CAPACITY, examples[SCENARIO_MODE_HOSTING_CAPACITY])}",
+        "load_pv_map: ESS와 제어 조건을 고정하고 Load-PV 운전점을 목적성 있게 배치해 2D 운영영역을 만듭니다.",
+        f"예시 진행: {_scenario_flow_example_text(SCENARIO_MODE_LOAD_PV_MAP, examples[SCENARIO_MODE_LOAD_PV_MAP])}",
+        "ess_sizing: 대표 스트레스 케이스를 고정하고 ESS 크기와 위치를 바꿔 최소 필요 용량과 위치 민감도를 봅니다.",
+        f"예시 진행: {_scenario_flow_example_text(SCENARIO_MODE_ESS_SIZING, examples[SCENARIO_MODE_ESS_SIZING])}",
+    ]
 
 def _prepare_scenario_inputs(
     config: Dict[str, float],
     bus_df: pd.DataFrame,
     scenario: Optional[Dict[str, Any]],
 ) -> tuple[Dict[str, float], pd.DataFrame, Dict[str, Any]]:
+    scenario_config = advanced_config(config)
+    default_location = int(scenario_config.get("ess_bus_number", BUS_COUNT))
     scenario_data = {
         "scenario_id": "SCN_BASE",
+        "mode": SCENARIO_MODE_HOSTING_CAPACITY,
+        "mode_label": scenario_mode_label(SCENARIO_MODE_HOSTING_CAPACITY),
         "PV_penetration": 1.0,
         "ESS_size": 1.0,
         "Load_growth": 1.0,
+        "ESS_location": default_location,
+        "control_case": str(scenario_config.get("control_case", CONTROL_CASE_OLTC_ESS)),
+        "control_case_label": control_case_label(str(scenario_config.get("control_case", CONTROL_CASE_OLTC_ESS))),
+        "base_stress_case": "",
+        "scenario_label": "Base case",
+        "scenario_description": "Base reference scenario",
     }
     if scenario:
-        scenario_data.update({key: scenario[key] for key in scenario if key in scenario_data or key == "scenario_id"})
+        scenario_data.update(dict(scenario))
 
-    scenario_config = advanced_config(config)
+    scenario_data["control_case"] = str(scenario_data.get("control_case", CONTROL_CASE_OLTC_ESS)).lower()
+    scenario_data["control_case_label"] = control_case_label(str(scenario_data["control_case"]))
+    scenario_data["ESS_location"] = int(scenario_data.get("ESS_location", default_location))
+    scenario_data["PV_penetration"] = float(scenario_data.get("PV_penetration", 1.0))
+    scenario_data["ESS_size"] = max(0.0, float(scenario_data.get("ESS_size", 1.0)))
+    scenario_data["Load_growth"] = float(scenario_data.get("Load_growth", 1.0))
+
+    scenario_config["control_case"] = str(scenario_data["control_case"])
+    scenario_config["ess_bus_number"] = int(scenario_data["ESS_location"])
+
     scenario_bus_df = _normalize_bus_dataframe(bus_df).copy()
     scenario_bus_df[PV_P_COL] = pd.to_numeric(scenario_bus_df[PV_P_COL], errors="coerce").fillna(0.0) * float(scenario_data["PV_penetration"])
     scenario_config["ess_power_mw"] = float(scenario_config.get("ess_power_mw", 0.0)) * float(scenario_data["ESS_size"])
     scenario_config["ess_capacity_mwh"] = float(scenario_config.get("ess_capacity_mwh", 0.0)) * float(scenario_data["ESS_size"])
+    if str(scenario_config.get("control_case", CONTROL_CASE_OLTC_ESS)) != CONTROL_CASE_OLTC_ESS:
+        scenario_config["ess_power_mw"] = 0.0
+        scenario_config["ess_capacity_mwh"] = 0.0
     return scenario_config, scenario_bus_df, scenario_data
 
 
@@ -364,9 +794,20 @@ def _summarize_single_run(
 
     return {
         "scenario_id": str(scenario_data.get("scenario_id", "SCN_BASE")),
+        "mode": str(scenario_data.get("mode", "")),
+        "mode_label": str(scenario_data.get("mode_label", scenario_mode_label(str(scenario_data.get("mode", ""))))),
+        "control_case": str(scenario_data.get("control_case", CONTROL_CASE_OLTC_ESS)),
+        "control_case_label": str(scenario_data.get("control_case_label", control_case_label(str(scenario_data.get("control_case", CONTROL_CASE_OLTC_ESS))))),
         "PV_penetration": float(scenario_data.get("PV_penetration", 1.0)),
         "ESS_size": float(scenario_data.get("ESS_size", 1.0)),
+        "ESS_location": int(scenario_data.get("ESS_location", scenario_config.get("ess_bus_number", BUS_COUNT))),
         "Load_growth": float(scenario_data.get("Load_growth", 1.0)),
+        "base_stress_case": str(scenario_data.get("base_stress_case", "")),
+        "scenario_label": str(scenario_data.get("scenario_label", "")),
+        "scenario_description": str(scenario_data.get("scenario_description", "")),
+        "voltage_ok": bool(events.get("voltage_ok", False)),
+        "line_ok": bool(events.get("line_ok", False)),
+        "overall_ok": bool(events.get("overall_ok", False)),
         "min_voltage": float(events.get("global_min_voltage", np.nan)),
         "max_voltage": float(events.get("global_max_voltage", np.nan)),
         "voltage_violation_count": voltage_violation_count,
@@ -384,7 +825,6 @@ def _summarize_single_run(
         "ESS_energy_capacity_mwh": float(scenario_config.get("ess_capacity_mwh", 0.0)),
         "Load_base_total_mw": float(scenario_bus_df[LOAD_P_COL].sum()),
     }
-
 
 def run_single_simulation(
     config: Dict[str, float],
@@ -443,9 +883,17 @@ def _batch_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             "scenario": scenario,
             "summary": {
                 "scenario_id": str(scenario.get("scenario_id", "SCN_ERROR")),
+                "mode": str(scenario.get("mode", "")),
+                "mode_label": str(scenario.get("mode_label", scenario_mode_label(str(scenario.get("mode", ""))))),
+                "control_case": str(scenario.get("control_case", CONTROL_CASE_OLTC_ESS)),
+                "control_case_label": str(scenario.get("control_case_label", control_case_label(str(scenario.get("control_case", CONTROL_CASE_OLTC_ESS))))),
                 "PV_penetration": float(scenario.get("PV_penetration", 1.0)),
                 "ESS_size": float(scenario.get("ESS_size", 1.0)),
+                "ESS_location": int(scenario.get("ESS_location", 0) or 0),
                 "Load_growth": float(scenario.get("Load_growth", 1.0)),
+                "base_stress_case": str(scenario.get("base_stress_case", "")),
+                "scenario_label": str(scenario.get("scenario_label", "")),
+                "scenario_description": str(scenario.get("scenario_description", "")),
                 "min_voltage": np.nan,
                 "max_voltage": np.nan,
                 "voltage_violation_count": np.nan,
@@ -481,6 +929,8 @@ def aggregate_batch_results(summary_records: list[Dict[str, Any]]) -> pd.DataFra
         "scenario_count": int(len(summary_df)),
         "violation_count": int(summary_df["violation_flag"].fillna(False).sum()) if "violation_flag" in summary_df.columns else 0,
         "converged_count": int(converged_mask.sum()) if not converged_mask.empty else 0,
+        "modes": ", ".join(sorted(summary_df["mode_label"].dropna().astype(str).unique())) if "mode_label" in summary_df.columns else "",
+        "control_cases": ", ".join(sorted(summary_df["control_case_label"].dropna().astype(str).unique())) if "control_case_label" in summary_df.columns else "",
         "min_of_min_voltage": float(pd.to_numeric(summary_df["min_voltage"], errors="coerce").min()) if "min_voltage" in summary_df.columns else np.nan,
         "max_of_max_voltage": float(pd.to_numeric(summary_df["max_voltage"], errors="coerce").max()) if "max_voltage" in summary_df.columns else np.nan,
         "max_line_loading": float(pd.to_numeric(summary_df["max_line_loading"], errors="coerce").max()) if "max_line_loading" in summary_df.columns else np.nan,
@@ -490,7 +940,6 @@ def aggregate_batch_results(summary_records: list[Dict[str, Any]]) -> pd.DataFra
         "total_ess_discharge_energy": float(pd.to_numeric(summary_df["ESS_discharge_energy"], errors="coerce").sum()) if "ESS_discharge_energy" in summary_df.columns else np.nan,
     }
     return pd.DataFrame([aggregate])
-
 
 def build_batch_summary_csv_bytes(batch_result: Dict[str, Any]) -> bytes:
     """Export batch summary rows to CSV bytes without affecting single-run exports."""
@@ -634,8 +1083,19 @@ def run_coordinated_daily_simulation(
     time_step_mins: int = 10,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
-    # 상태기반 협조제어의 핵심 시뮬레이션 루프: 부하/재생에너지 패턴을 적용하고 OLTC-ESS를 동시에 제어한다.
+    # Main coordinated-control loop for one independent time-series run.
     cfg = advanced_config(config)
+    control_case = str(cfg.get("control_case", CONTROL_CASE_OLTC_ESS)).lower()
+    if control_case not in CONTROL_CASE_LABELS:
+        supported = ", ".join(CONTROL_CASE_LABELS)
+        raise ValueError(f"Unsupported control_case '{control_case}'. Supported control cases: {supported}")
+    cfg["control_case"] = control_case
+    oltc_enabled = control_case in [CONTROL_CASE_OLTC_ONLY, CONTROL_CASE_OLTC_ESS]
+    ess_enabled = control_case == CONTROL_CASE_OLTC_ESS
+    if not ess_enabled:
+        cfg["ess_power_mw"] = 0.0
+        cfg["ess_capacity_mwh"] = 0.0
+
     bus_data = prepare_single_ess_bus_df(bus_df, cfg)
     sim_time = prepare_analysis_profile(time_df, total_minutes=total_minutes, time_step_mins=time_step_mins, config=cfg)
     minute_points = sim_time[MINUTE_COL].astype(int).tolist()
@@ -726,26 +1186,47 @@ def run_coordinated_daily_simulation(
         _, pre_line_mva, _, signed_p = line_metrics(net)
         current_state = determine_state(current_state, pre_min_v, pre_max_v, pre_line_mva, cfg)
 
-        ess_caps = [float(bus_data.at[i, ESS_MAX_COL]) for i in range(BUS_COUNT)]
+        ess_caps = [float(bus_data.at[i, ESS_MAX_COL]) if ess_enabled else 0.0 for i in range(BUS_COUNT)]
         ess_weights = [i + 1 for i in range(BUS_COUNT)]
-        p_target = 0.0
-        q_target = 0.0
 
-        # 선로 혼잡을 최우선으로 처리하고, 그 다음 저전압/과전압 상태를 제어한다.
         if current_state == STATE_CONGESTION:
-            overload = max(0.0, pre_line_mva - float(cfg["line_limit_mva"]))
-            p_target = min(sum(ess_caps), overload * float(cfg["line_relief_gain"]))
-            if signed_p < 0.0:
-                p_target *= -1.0
-            current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
-            current_q_cmd = [ramp_to_zero(v, ramp_limit) for v in current_q_cmd]
-            # 혼잡 상태에서도 전압 이상이 동반되면 OLTC가 보조적으로 개입하도록 허용한다.
-            if pre_max_v > float(cfg["voltage_max_limit"]) and current_tap < 8:
-                oltc_timer_mins += delta_mins
-                if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
-                    current_tap += 1
+            if ess_enabled:
+                overload = max(0.0, pre_line_mva - float(cfg["line_limit_mva"]))
+                p_target = min(sum(ess_caps), overload * float(cfg["line_relief_gain"]))
+                if signed_p < 0.0:
+                    p_target *= -1.0
+                current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
+                current_q_cmd = [ramp_to_zero(v, ramp_limit) for v in current_q_cmd]
+            else:
+                current_p_cmd = [0.0] * BUS_COUNT
+                current_q_cmd = [0.0] * BUS_COUNT
+            if oltc_enabled:
+                if pre_max_v > float(cfg["voltage_max_limit"]) and current_tap < 8:
+                    oltc_timer_mins += delta_mins
+                    if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
+                        current_tap += 1
+                        oltc_timer_mins = 0.0
+                elif pre_min_v < float(cfg["voltage_min_limit"]) and current_tap > -8:
+                    oltc_timer_mins += delta_mins
+                    if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
+                        current_tap -= 1
+                        oltc_timer_mins = 0.0
+                else:
                     oltc_timer_mins = 0.0
-            elif pre_min_v < float(cfg["voltage_min_limit"]) and current_tap > -8:
+            else:
+                oltc_timer_mins = 0.0
+            recover_timer_mins = 0.0
+        elif current_state == STATE_UNDERVOLTAGE:
+            if ess_enabled:
+                deficit = max(0.0, float(cfg["voltage_min_limit"]) - pre_min_v)
+                p_target = min(sum(ess_caps), deficit * float(cfg["ess_p_gain"]))
+                q_target = min(sum(ess_caps), deficit * float(cfg["ess_q_gain"]))
+                current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
+                current_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
+            else:
+                current_p_cmd = [0.0] * BUS_COUNT
+                current_q_cmd = [0.0] * BUS_COUNT
+            if oltc_enabled and current_tap > -8:
                 oltc_timer_mins += delta_mins
                 if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
                     current_tap -= 1
@@ -753,42 +1234,44 @@ def run_coordinated_daily_simulation(
             else:
                 oltc_timer_mins = 0.0
             recover_timer_mins = 0.0
-        elif current_state == STATE_UNDERVOLTAGE:
-            deficit = max(0.0, float(cfg["voltage_min_limit"]) - pre_min_v)
-            p_target = min(sum(ess_caps), deficit * float(cfg["ess_p_gain"]))
-            q_target = min(sum(ess_caps), deficit * float(cfg["ess_q_gain"]))
-            current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
-            current_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
-            if current_tap > -8:
-                oltc_timer_mins += delta_mins
-                if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
-                    current_tap -= 1
-                    oltc_timer_mins = 0.0
-            recover_timer_mins = 0.0
         elif current_state == STATE_OVERVOLTAGE:
-            excess = max(0.0, pre_max_v - float(cfg["voltage_max_limit"]))
-            p_target = -min(sum(ess_caps), excess * float(cfg["ess_p_gain"]))
-            q_target = -min(sum(ess_caps), excess * float(cfg["ess_q_gain"]))
-            current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
-            current_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
-            if current_tap < 8:
+            if ess_enabled:
+                excess = max(0.0, pre_max_v - float(cfg["voltage_max_limit"]))
+                p_target = -min(sum(ess_caps), excess * float(cfg["ess_p_gain"]))
+                q_target = -min(sum(ess_caps), excess * float(cfg["ess_q_gain"]))
+                current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
+                current_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
+            else:
+                current_p_cmd = [0.0] * BUS_COUNT
+                current_q_cmd = [0.0] * BUS_COUNT
+            if oltc_enabled and current_tap < 8:
                 oltc_timer_mins += delta_mins
                 if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
                     current_tap += 1
                     oltc_timer_mins = 0.0
+            else:
+                oltc_timer_mins = 0.0
             recover_timer_mins = 0.0
         else:
-            current_p_cmd = [ramp_to_zero(v, ramp_limit) for v in current_p_cmd]
-            current_q_cmd = [ramp_to_zero(v, ramp_limit) for v in current_q_cmd]
-            oltc_timer_mins = 0.0
-            recover_timer_mins += delta_mins
-            if recover_timer_mins >= float(cfg["oltc_return_delay_mins"]):
-                if current_tap > 0:
-                    current_tap -= 1
-                    recover_timer_mins = 0.0
-                elif current_tap < 0:
-                    current_tap += 1
-                    recover_timer_mins = 0.0
+            if ess_enabled:
+                current_p_cmd = [ramp_to_zero(v, ramp_limit) for v in current_p_cmd]
+                current_q_cmd = [ramp_to_zero(v, ramp_limit) for v in current_q_cmd]
+            else:
+                current_p_cmd = [0.0] * BUS_COUNT
+                current_q_cmd = [0.0] * BUS_COUNT
+            if oltc_enabled:
+                oltc_timer_mins = 0.0
+                recover_timer_mins += delta_mins
+                if recover_timer_mins >= float(cfg["oltc_return_delay_mins"]):
+                    if current_tap > 0:
+                        current_tap -= 1
+                        recover_timer_mins = 0.0
+                    elif current_tap < 0:
+                        current_tap += 1
+                        recover_timer_mins = 0.0
+            else:
+                oltc_timer_mins = 0.0
+                recover_timer_mins = 0.0
 
         for i in range(BUS_COUNT):
             ess_max = float(bus_data.at[i, ESS_MAX_COL])
@@ -977,11 +1460,12 @@ def run_coordinated_daily_simulation(
         "ess_bus_number": int(cfg["ess_bus_number"]),
         "ess_power_mw": float(cfg["ess_power_mw"]),
         "ess_capacity_mwh": float(cfg["ess_capacity_mwh"]),
+        "control_case": control_case,
+        "control_case_label": control_case_label(control_case),
         "runpp_failure_count": int(runpp_failure_count),
         "convergence_status": "CONVERGED" if int(runpp_failure_count) == 0 else "FALLBACK_USED",
     }
     return results, events
-
 
 def _load_level_metrics(results: Dict[str, pd.DataFrame]) -> Dict[str, float]:
     df_profile = results.get("df_profile", pd.DataFrame())
@@ -1180,8 +1664,10 @@ def _report_lines(search_result: Dict[str, Any]) -> list[str]:
         f"전압 허용범위: {float(limits.get('voltage_min', 0.94)):.3f} ~ {float(limits.get('voltage_max', 1.06)):.3f} p.u.",
         f"선로용량 허용치: {float(limits.get('line_limit_mva', 12.0)):.2f} MVA",
         "",
-        "계통 기본 구성",
+        "연구형 시나리오 생성 및 진행 방식",
     ]
+    lines.extend(scenario_workflow_lines(search_result.get("config", {})))
+    lines.extend(["", "계통 기본 구성"])
     if isinstance(bus_df, pd.DataFrame) and not bus_df.empty:
         for _, row in bus_df.iterrows():
             lines.append(
@@ -1268,15 +1754,15 @@ def _abnormal_diagnosis(search_result: Dict[str, Any]) -> list[str]:
     max_v = float(first_failure.get("max_voltage", np.nan))
     max_line = float(first_failure.get("max_line_mva", np.nan))
 
-    if "선로용량" in cause and max_line > line_limit:
+    if ("선로용량" in cause or "line" in cause) and max_line > line_limit:
         diagnosis.append(f"첫 이탈 원인은 선로용량 제약입니다. 전압보다 선로 조류가 먼저 한계 {line_limit:.2f} MVA를 넘었으므로 ESS 위치 또는 선로 혼잡 완화 이득이 부족했을 가능성이 큽니다.")
     if any((not bool(run.get("line_ok", True))) and bool(run.get("voltage_ok", False)) for run in runs):
         diagnosis.append("전압이 허용범위 안에 있어도 선로용량은 별도로 초과될 수 있습니다. 현재 결과는 강한 계통 전원과 짧은 선로로 인해 전압은 비교적 유지되지만, 역송전 전력이 커져 열적 한계가 먼저 위반된 상황에 가깝습니다.")
     voltage_min = float(search_result.get("limits", {}).get("voltage_min", 0.94))
     voltage_max = float(search_result.get("limits", {}).get("voltage_max", 1.06))
-    if "전압" in cause and min_v < voltage_min:
+    if ("전압" in cause or "voltage" in cause) and min_v < voltage_min:
         diagnosis.append(f"첫 이탈 원인은 저전압입니다. 부하 증가 또는 말단 전압강하에 비해 OLTC 탭업과 ESS 방전 보조가 충분히 빠르지 않아 전압 하한 {voltage_min:.3f} p.u.를 밑돌았습니다.")
-    if "전압" in cause and max_v > voltage_max:
+    if ("전압" in cause or "voltage" in cause) and max_v > voltage_max:
         diagnosis.append(f"첫 이탈 원인은 과전압입니다. 재생에너지 증가 구간에서 OLTC 탭다운 또는 ESS 충전 흡수가 부족해 전압 상한 {voltage_max:.3f} p.u.를 넘었습니다.")
     if float(last_events.get("soc_min", 100.0)) <= 5.0:
         diagnosis.append("ESS SOC가 하한에 가까워졌습니다. 에너지 용량 부족 또는 방전 전략 과개입 때문에 후반부 제어 여력이 줄었을 수 있습니다.")

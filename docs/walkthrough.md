@@ -1,7 +1,7 @@
 ﻿# Walkthrough
 
 ## 개요
-이 문서는 2026-03-10 기준으로 `DL` 폴더 프로젝트에 대해 무엇을 어떻게 수정했는지 단계별로 정리한 작업 기록입니다.
+이 문서는 2026-03-11 기준으로 `DL` 폴더 프로젝트에 대해 무엇을 어떻게 수정했는지 단계별로 정리한 작업 기록입니다.
 
 ## 1. 초기 상태
 초기 프로젝트는 `DL.py`에 UI, 계통 생성, 시뮬레이션 루프, 제어 로직이 섞여 있었습니다. 이 상태에서는 기능 추가와 유지보수가 어렵고, 자동 분석/보고서/알고리즘 수정 기능을 확장하기에 구조가 불안정했습니다.
@@ -48,6 +48,7 @@
 ### 지원 시나리오
 - 부하만 증가
 - 재생에너지 출력 증가
+- 부하와 재생에너지 동시 증가
 - 부하구간별 재생에너지 증가
 
 ### 분석 방식
@@ -68,16 +69,18 @@
 ### 수정 내용
 - `python-docx` 기반 그래프 포함 보고서 경로 유지
 - 실패 시 수동 OOXML fallback 경로 추가
-- 공통 종합 그래프 외에 회차별 전압/선로용량 그래프 포함하도록 수정
+- 공통 종합 그래프 외에 회차별 전압/선로용량 그래프 포함
 - 이상 결과 원인 분석 섹션 추가
 - 회차별 운영 범위 정보 포함
+- 연구형 시나리오 생성 및 진행 방식 설명 추가
 
 ### 현재 보고서 구성
 - 기본 설정
+- 시나리오 진행 원칙 및 예시 흐름
 - 계통 구성
 - 부하/PV/Wind 패턴 그래프
 - 민감도 종합 그래프
-- 대표 시뮬레이션 시계열 그래프
+- 대표 시뮬레이션 그래프
 - 회차별 전압 및 선로용량 그래프
 - 회차별 운영 범위
 - 결과 요약 및 개선 방향
@@ -97,7 +100,7 @@
 ## 9. 현재 기준 주요 파일 역할
 - `DL.py`: UI, 실행 제어, 시각화
 - `sim_engine.py`: 기본 엔진, 기본 계통/프로파일
-- `coordinated_engine.py`: 협조제어, 민감도 분석, 보고서
+- `coordinated_engine.py`: 협조제어, 민감도 분석, 시나리오 생성, 배치 실행, 보고서
 - `limit_finder.py`: CLI 실행
 
 ## 10. 다음에 이어서 보기 좋은 작업
@@ -105,3 +108,45 @@
 - 실제 중지 가능한 백그라운드 실행 구조 도입
 - 자동 최적화 알고리즘 연계
 - 보고서 레이아웃/표 품질 개선
+
+## 11. 연구형 배치 시나리오 생성기 추가
+### 배경
+이전 batch 구조는 `PV x ESS x Load` 식 조합 중심이라 연구 질문과 직접 연결되지 않는 경우가 있었습니다. 그래서 무작위/무의미 조합을 줄이고, 질문 중심으로 시나리오를 생성하도록 구조를 바꿨습니다.
+
+### 새 원칙
+- UI는 유지하고 기존 `Batch Scenario Runner` 안에서만 동작
+- 무작위 조합 금지
+- 의미 없는 Cartesian product 금지
+- 연구 질문별 `scenario mode`로 생성
+- 생성과 실행을 분리
+
+### 지원 mode
+- `hosting_capacity`
+- `load_pv_map`
+- `ess_sizing`
+
+### mode별 동작
+- `hosting_capacity`: Load, ESS, control을 고정하고 PV만 단조 증가시켜 첫 위반 시점과 수용 한계를 찾음
+- `load_pv_map`: Load와 PV를 목적성 있는 2D 운전점으로 배치해 운영영역을 작성함
+- `ess_sizing`: 대표 스트레스 케이스를 고정하고 ESS 크기 및 위치를 바꿔 효과를 비교함
+
+### 생성 흐름
+- 사용자 설정 또는 CLI 입력 수집
+- mode별 settings 구성
+- 고정 변수/가변 변수 검증
+- 불가능한 조합 제거
+- 중복 제거
+- `SCN_###` ID, label, description 부여
+- preview 표 생성
+- 기존 batch 실행 엔진에 전달
+
+### 예시 진행
+- `hosting_capacity`: `SCN_001 PV 0.80 -> SCN_002 PV 1.00 -> SCN_003 PV 1.20`
+- `load_pv_map`: `SCN_001 Load 0.90 / PV 0.80, SCN_002 Load 0.90 / PV 1.20, SCN_003 Load 1.10 / PV 0.80, SCN_004 Load 1.10 / PV 1.20`
+- `ess_sizing`: `SCN_001 Size 0.00 / Bus 5 -> SCN_002 Size 0.50 / Bus 5 -> SCN_003 Size 1.00 / Bus 5`
+
+### 구현 포인트
+- `coordinated_engine.py`: mode 정의, generator, validation/filter, scenario metadata, preview helper, batch summary metadata
+- `DL.py`: 기존 expander 안에 mode 선택과 preview 연결
+- `limit_finder.py`: batch mode CLI 인자 확장
+- 보고서: 시나리오 진행 원칙과 예시 흐름 텍스트 추가

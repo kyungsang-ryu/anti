@@ -1,4 +1,4 @@
-﻿import math
+import math
 import os
 import subprocess
 import sys
@@ -8,20 +8,30 @@ import plotly.express as px
 import streamlit as st
 
 from coordinated_engine import (
+    CONTROL_CASE_NO_CONTROL,
+    CONTROL_CASE_OLTC_ESS,
+    CONTROL_CASE_OLTC_ONLY,
     SCENARIO_BOTH_INCREASE,
     SCENARIO_LOAD_INCREASE,
+    SCENARIO_MODE_ESS_SIZING,
+    SCENARIO_MODE_HOSTING_CAPACITY,
+    SCENARIO_MODE_LOAD_PV_MAP,
     SCENARIO_RENEWABLE_BY_LOAD_LEVEL,
     SCENARIO_RENEWABLE_INCREASE,
     build_analysis_excel_bytes,
     build_batch_summary_csv_bytes,
     build_batch_summary_excel_bytes,
+    build_scenario_preview_df,
     build_word_report_bytes,
+    control_case_label,
     generate_scenarios,
     prepare_single_ess_bus_df,
     run_batch_simulations,
     run_sensitivity_search,
     run_single_simulation,
     scenario_label,
+    scenario_mode_label,
+    scenario_mode_metadata,
 )
 from sim_engine import (
     BUS_COL,
@@ -45,7 +55,16 @@ SCENARIO_OPTIONS = [
 ]
 BUS_OPTIONS = [f"Bus {i}" for i in range(1, 6)]
 BUS_INDEX_MAP = {name: idx + 1 for idx, name in enumerate(BUS_OPTIONS)}
-
+BATCH_SCENARIO_MODE_OPTIONS = [
+    SCENARIO_MODE_HOSTING_CAPACITY,
+    SCENARIO_MODE_LOAD_PV_MAP,
+    SCENARIO_MODE_ESS_SIZING,
+]
+CONTROL_CASE_OPTIONS = [
+    CONTROL_CASE_NO_CONTROL,
+    CONTROL_CASE_OLTC_ONLY,
+    CONTROL_CASE_OLTC_ESS,
+]
 def algorithm_preset_values(preset_name: str) -> dict:
     # 문서 기준 알고리즘과 현재 기본 알고리즘을 버튼으로 바로 적용할 수 있도록 preset을 제공한다.
     presets = {
@@ -154,9 +173,15 @@ def init_session_state():
     st.session_state.setdefault("cfg_z_cncv_str", "0.07 + j0.12")
     st.session_state.setdefault("cfg_z_acsr_str", "0.18 + j0.39")
     st.session_state.setdefault("cfg_ess_bus_label", "Bus 5")
-    st.session_state.setdefault("cfg_batch_pv_values", "0.8,1.0,1.2")
-    st.session_state.setdefault("cfg_batch_ess_values", "0.5,1.0,1.5")
-    st.session_state.setdefault("cfg_batch_load_values", "1.0,1.1,1.2")
+    st.session_state.setdefault("cfg_batch_mode", SCENARIO_MODE_HOSTING_CAPACITY)
+    st.session_state.setdefault("cfg_batch_control_case", CONTROL_CASE_OLTC_ESS)
+    st.session_state.setdefault("cfg_batch_pv_values", "0.8,1.0,1.2,1.4,1.6")
+    st.session_state.setdefault("cfg_batch_ess_values", "0.0,0.5,1.0,1.5")
+    st.session_state.setdefault("cfg_batch_load_values", "0.8,1.0,1.2,1.4")
+    st.session_state.setdefault("cfg_batch_ess_location_values", "3,4,5")
+    st.session_state.setdefault("cfg_batch_hosting_load_growth", 1.0)
+    st.session_state.setdefault("cfg_batch_base_pv_penetration", 1.6)
+    st.session_state.setdefault("cfg_batch_base_load_growth", 1.0)
     st.session_state.setdefault("cfg_batch_parallel", True)
     st.session_state.setdefault("cfg_batch_include_timeseries", False)
     st.session_state.setdefault("cfg_batch_max_workers", min(4, max(1, int(os.cpu_count() or 1))))
@@ -205,21 +230,146 @@ def reset_run_state(clear_results: bool = True):
 
 
 def build_batch_settings_from_state() -> dict:
-    """Collect batch scenario specifications without changing the existing UI structure."""
-    return {
-        "pv_penetration": st.session_state["cfg_batch_pv_values"],
-        "ess_size": st.session_state["cfg_batch_ess_values"],
-        "load_growth": st.session_state["cfg_batch_load_values"],
+    """Collect research-question-driven batch settings while keeping the current UI layout intact."""
+    mode = st.session_state["cfg_batch_mode"]
+    settings = {
+        "mode": mode,
+        "default_ess_location": int(st.session_state["cfg_ess_bus_number"]),
+        "base_ess_power_mw": float(st.session_state["cfg_ess_power_mw"]),
+        "base_ess_capacity_mwh": float(st.session_state["cfg_ess_capacity_mwh"]),
     }
+    if mode == SCENARIO_MODE_HOSTING_CAPACITY:
+        settings.update(
+            {
+                "pv_penetration": st.session_state["cfg_batch_pv_values"],
+                "load_growth": float(st.session_state["cfg_batch_hosting_load_growth"]),
+                "ess_size": 1.0,
+                "ess_location": int(st.session_state["cfg_ess_bus_number"]),
+                "control_case": st.session_state["cfg_batch_control_case"],
+            }
+        )
+    elif mode == SCENARIO_MODE_LOAD_PV_MAP:
+        settings.update(
+            {
+                "pv_penetration": st.session_state["cfg_batch_pv_values"],
+                "load_growth": st.session_state["cfg_batch_load_values"],
+                "ess_size": 1.0,
+                "ess_location": int(st.session_state["cfg_ess_bus_number"]),
+                "control_case": st.session_state["cfg_batch_control_case"],
+            }
+        )
+    else:
+        settings.update(
+            {
+                "base_pv_penetration": float(st.session_state["cfg_batch_base_pv_penetration"]),
+                "base_load_growth": float(st.session_state["cfg_batch_base_load_growth"]),
+                "ess_size": st.session_state["cfg_batch_ess_values"],
+                "ess_location": st.session_state["cfg_batch_ess_location_values"],
+                "control_case": CONTROL_CASE_OLTC_ESS,
+                "base_stress_case": (
+                    f"PV {float(st.session_state['cfg_batch_base_pv_penetration']):.2f}, "
+                    f"Load {float(st.session_state['cfg_batch_base_load_growth']):.2f}"
+                ),
+            }
+        )
+    return settings
+
 
 
 def render_batch_mode_panel(locked: bool) -> bool:
-    """Render a small optional batch-mode section under the existing execution controls."""
+    """Render the existing batch expander with research-mode inputs and a lightweight preview."""
     with st.expander("Batch Scenario Runner", expanded=False):
-        st.caption("Batch mode generates PV penetration x ESS size x load growth scenarios and runs them without changing the existing single-run UI.")
-        st.text_input("PV Penetration", key="cfg_batch_pv_values", disabled=locked, help="Examples: 0.8,1.0,1.2 or 0.8:1.2:0.2")
-        st.text_input("ESS Size", key="cfg_batch_ess_values", disabled=locked, help="Examples: 0.5,1.0,1.5")
-        st.text_input("Load Growth", key="cfg_batch_load_values", disabled=locked, help="Examples: 1.0,1.1,1.2")
+        st.caption("Batch mode now generates research-question-driven scenarios instead of a blind Cartesian product.")
+        st.selectbox(
+            "Scenario Mode",
+            options=BATCH_SCENARIO_MODE_OPTIONS,
+            format_func=scenario_mode_label,
+            key="cfg_batch_mode",
+            disabled=locked,
+        )
+        mode = st.session_state["cfg_batch_mode"]
+        mode_meta = scenario_mode_metadata(mode)
+        st.caption(mode_meta["research_question"])
+        st.caption(f"Fixed: {mode_meta['fixed_variables']} | Varied: {mode_meta['varied_variables']}")
+
+        ess_baseline = (
+            f"Current ESS baseline from sidebar: Bus {int(st.session_state['cfg_ess_bus_number'])}, "
+            f"{float(st.session_state['cfg_ess_power_mw']):.2f} MW / {float(st.session_state['cfg_ess_capacity_mwh']):.2f} MWh"
+        )
+
+        if mode == SCENARIO_MODE_HOSTING_CAPACITY:
+            st.text_input(
+                "PV Penetration Sweep",
+                key="cfg_batch_pv_values",
+                disabled=locked,
+                help="Monotonic PV sweep, e.g. 0.8,1.0,1.2,1.4 or 0.8:1.6:0.2",
+            )
+            st.number_input(
+                "Fixed Load Growth",
+                min_value=0.1,
+                step=0.1,
+                key="cfg_batch_hosting_load_growth",
+                disabled=locked,
+            )
+            st.selectbox(
+                "Control Case",
+                options=CONTROL_CASE_OPTIONS,
+                format_func=control_case_label,
+                key="cfg_batch_control_case",
+                disabled=locked,
+            )
+            st.caption(ess_baseline)
+        elif mode == SCENARIO_MODE_LOAD_PV_MAP:
+            st.text_input(
+                "PV Penetration Grid",
+                key="cfg_batch_pv_values",
+                disabled=locked,
+                help="Structured PV axis, e.g. 0.8,1.0,1.2,1.4",
+            )
+            st.text_input(
+                "Load Growth Grid",
+                key="cfg_batch_load_values",
+                disabled=locked,
+                help="Structured load axis, e.g. 0.8,1.0,1.2,1.4",
+            )
+            st.selectbox(
+                "Control Case",
+                options=CONTROL_CASE_OPTIONS,
+                format_func=control_case_label,
+                key="cfg_batch_control_case",
+                disabled=locked,
+            )
+            st.caption(ess_baseline)
+        else:
+            st.number_input(
+                "Base PV Penetration",
+                min_value=0.0,
+                step=0.1,
+                key="cfg_batch_base_pv_penetration",
+                disabled=locked,
+            )
+            st.number_input(
+                "Base Load Growth",
+                min_value=0.1,
+                step=0.1,
+                key="cfg_batch_base_load_growth",
+                disabled=locked,
+            )
+            st.text_input(
+                "ESS Size Sweep",
+                key="cfg_batch_ess_values",
+                disabled=locked,
+                help="ESS size multipliers relative to the current sidebar ESS rating, e.g. 0.0,0.5,1.0,1.5",
+            )
+            st.text_input(
+                "ESS Location Sweep",
+                key="cfg_batch_ess_location_values",
+                disabled=locked,
+                help="Bus numbers, e.g. 3,4,5",
+            )
+            st.caption(ess_baseline)
+            st.caption("ESS sizing fixes control case to OLTC + ESS and uses the current sidebar ESS rating as the base unit.")
+
         c1, c2, c3 = st.columns(3)
         with c1:
             st.checkbox("Parallel Execution", key="cfg_batch_parallel", disabled=locked)
@@ -230,13 +380,18 @@ def render_batch_mode_panel(locked: bool) -> bool:
 
         scenarios = []
         try:
-            scenarios = generate_scenarios(build_batch_settings_from_state())
+            batch_settings = build_batch_settings_from_state()
+            scenarios = generate_scenarios(mode, batch_settings)
+            preview_df = build_scenario_preview_df(scenarios)
             st.caption(f"Scenario count: {len(scenarios)}")
+            if not preview_df.empty:
+                st.dataframe(preview_df.head(12), use_container_width=True, hide_index=True)
+                if len(preview_df) > 12:
+                    st.caption("Preview shows the first 12 scenarios only.")
         except Exception as exc:
             st.warning(f"Scenario specification error: {exc}")
 
         return st.button("Batch Scenario Execution", key="run_batch_button", disabled=locked or len(scenarios) == 0)
-
 def render_run_controls():
     # Streamlit 동기 실행 구조에서는 페이지 내부 버튼으로 현재 루프를 즉시 끊을 수 없다.
     # 대신 실행 상태, 중단 후 복구 방법, 재실행/초기화 버튼을 항상 같은 위치에 유지한다.
@@ -780,10 +935,11 @@ def run_auto_scenario(config):
 
 
 def run_batch_scenarios(config):
-    # 기존 UI 흐름을 유지하면서 배치 시나리오만 선택적으로 실행한다.
+    # Keep the existing UI flow and execute only the generated research scenarios.
     batch_settings = build_batch_settings_from_state()
+    batch_mode = st.session_state["cfg_batch_mode"]
     try:
-        scenarios = generate_scenarios(batch_settings)
+        scenarios = generate_scenarios(batch_mode, batch_settings)
     except Exception as exc:
         st.error(f"배치 시나리오 생성 오류: {exc}")
         st.session_state["is_running"] = False
@@ -820,8 +976,8 @@ def run_batch_scenarios(config):
         st.session_state["batch_result"] = batch_result
         st.session_state["batch_summary_csv_bytes"] = build_batch_summary_csv_bytes(batch_result)
         st.session_state["batch_summary_excel_bytes"] = build_batch_summary_excel_bytes(batch_result)
-        st.session_state["batch_summary_prefix"] = "batch_scenario_summary"
-        progress.progress(1.0, text="Batch scenario execution complete")
+        st.session_state["batch_summary_prefix"] = f"batch_{batch_mode}_summary"
+        progress.progress(1.0, text=f"{scenario_mode_label(batch_mode)} batch complete")
     finally:
         st.session_state["is_running"] = False
         st.session_state["active_run_action"] = None

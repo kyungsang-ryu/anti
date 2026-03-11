@@ -1,11 +1,15 @@
-﻿import argparse
+import argparse
 from pathlib import Path
 
 import pandas as pd
 
 from coordinated_engine import (
+    CONTROL_CASE_OLTC_ESS,
     SCENARIO_BOTH_INCREASE,
     SCENARIO_LOAD_INCREASE,
+    SCENARIO_MODE_ESS_SIZING,
+    SCENARIO_MODE_HOSTING_CAPACITY,
+    SCENARIO_MODE_LOAD_PV_MAP,
     SCENARIO_RENEWABLE_BY_LOAD_LEVEL,
     SCENARIO_RENEWABLE_INCREASE,
     build_batch_summary_csv_bytes,
@@ -14,6 +18,7 @@ from coordinated_engine import (
     run_batch_simulations,
     run_sensitivity_search,
     scenario_label,
+    scenario_mode_label,
     write_word_report,
 )
 from sim_engine import default_bus_dataframe, default_config, default_time_profile_dataframe, load_time_profile
@@ -37,9 +42,20 @@ def parse_args():
     parser.add_argument("--report-path", type=str, default="simulation_report.docx", help="Word report output path for sensitivity mode")
 
     parser.add_argument("--batch-mode", action="store_true", help="Run scenario generation and batch execution")
-    parser.add_argument("--pv-penetration", type=str, default="1.0", help="PV penetration values or range, e.g. 0.8,1.0,1.2 or 0.8:1.2:0.2")
-    parser.add_argument("--ess-size", type=str, default="1.0", help="ESS size multipliers, e.g. 0.5,1.0,1.5")
-    parser.add_argument("--load-growth", type=str, default="1.0", help="Load growth values, e.g. 1.0,1.1,1.2")
+    parser.add_argument(
+        "--batch-scenario-mode",
+        type=str,
+        default=SCENARIO_MODE_HOSTING_CAPACITY,
+        choices=[SCENARIO_MODE_HOSTING_CAPACITY, SCENARIO_MODE_LOAD_PV_MAP, SCENARIO_MODE_ESS_SIZING],
+        help="Research-driven batch scenario mode",
+    )
+    parser.add_argument("--pv-penetration", type=str, default="0.8,1.0,1.2,1.4,1.6", help="PV penetration values or range")
+    parser.add_argument("--ess-size", type=str, default="0.0,0.5,1.0,1.5", help="ESS size multipliers")
+    parser.add_argument("--ess-location", type=str, default="5", help="ESS location or location sweep, e.g. 5 or 3,4,5")
+    parser.add_argument("--load-growth", type=str, default="0.8,1.0,1.2,1.4", help="Load growth values or range")
+    parser.add_argument("--control-case", type=str, default=CONTROL_CASE_OLTC_ESS, help="Control case for batch modes")
+    parser.add_argument("--base-pv-penetration", type=float, default=1.6, help="Base PV penetration for ESS sizing mode")
+    parser.add_argument("--base-load-growth", type=float, default=1.0, help="Base load growth for ESS sizing mode")
     parser.add_argument("--max-workers", type=int, default=None, help="Max workers for parallel batch execution")
     parser.add_argument("--serial", action="store_true", help="Force serial execution for batch mode")
     parser.add_argument("--include-timeseries", action="store_true", help="Store detailed outputs in batch mode (forces serial)")
@@ -63,6 +79,9 @@ def main():
     config["voltage_max_limit"] = 1.06
     config["line_limit_mva"] = 12.0
     config["line_return_mva"] = 11.4
+    config["ess_power_mw"] = 5.0
+    config["ess_capacity_mwh"] = 15.0
+    config["ess_bus_number"] = 5
 
     bus_df = default_bus_dataframe()
     time_df = load_time_profile(args.profile) if args.profile else default_time_profile_dataframe()
@@ -73,12 +92,20 @@ def main():
 
     if args.batch_mode:
         settings = {
+            "mode": args.batch_scenario_mode,
             "pv_penetration": args.pv_penetration,
             "ess_size": args.ess_size,
+            "ess_location": args.ess_location,
             "load_growth": args.load_growth,
+            "control_case": args.control_case,
+            "base_pv_penetration": float(args.base_pv_penetration),
+            "base_load_growth": float(args.base_load_growth),
+            "default_ess_location": int(config["ess_bus_number"]),
+            "base_ess_power_mw": float(config["ess_power_mw"]),
+            "base_ess_capacity_mwh": float(config["ess_capacity_mwh"]),
         }
-        scenarios = generate_scenarios(settings)
-        print(f"[BATCH] Generated {len(scenarios)} scenarios")
+        scenarios = generate_scenarios(args.batch_scenario_mode, settings)
+        print(f"[BATCH] mode={scenario_mode_label(args.batch_scenario_mode)} | Generated {len(scenarios)} scenarios")
 
         batch_result = run_batch_simulations(
             scenarios=scenarios,
