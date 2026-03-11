@@ -1,89 +1,102 @@
-# ⚡ 24시간 동적 시뮬레이션: 협조 제어 시뮬레이터 (OLTC & ESS)
+﻿# 배전계통 OLTC-ESS 협조 제어 동적 시뮬레이터
 
-본 프로젝트는 **배전계통의 전압 문제를 해결하기 위해 변전소의 OLTC(On-Load Tap Changer)와 말단 모선의 ESS(Energy Storage System) 간의 협조 제어 알고리즘**을 시뮬레이션하는 도구입니다. Python 기반의 전력계통 해석 라이브러리인 `pandapower`와 웹 대시보드 프레임워크인 `streamlit`을 활용하여 구축되었습니다.
+이 프로젝트는 `pandapower` 기반 전력계통 해석과 `streamlit` 기반 UI를 결합한 배전계통 시뮬레이터입니다. 154kV/22.9kV 배전계통에서 OLTC 1대와 ESS 1대를 중심으로 전압 유지와 선로용량 제약을 함께 검토할 수 있도록 고도화했습니다.
 
----
+## 핵심 목적
+- 부하 및 재생에너지 변동에 따른 전압 변화 분석
+- OLTC-ESS 협조제어 알고리즘 시험
+- 자동 민감도 분석을 통한 허용치 이탈 지점 탐색
+- 분석 결과의 Excel/Word 보고서 생성
 
-## 🚀 주요 기능 (Features)
+## 현재 파일 구성
+- `DL.py`: Streamlit UI, 실행 상태 관리, 결과 시각화
+- `sim_engine.py`: 기본 계통 모델, 시간패턴 보간, 공통 시뮬레이션 유틸리티
+- `coordinated_engine.py`: 협조제어 로직, 자동 민감도 분석, 보고서 생성
+- `limit_finder.py`: CLI 기반 자동 분석 실행 스크립트
+- `walkthrough.md`: 이번 고도화 작업 상세 내역
+- `project_summary_2026-03-10.md`: 현재까지의 전체 작업 요약 및 인수인계 문서
 
-1. **배전계통 네트워크 모델링**
-   - 154kV / 22.9kV 변전소 모델링 및 OLTC 탭 제어(Tap Position 제어).
-   - CNCV 및 ACSR 케이블 등 선로별 파라미터(길이, 임피던스) 사용자 설정 인터페이스.
-   - 재생에너지(PV, Wind), 부하(Load), ESS 등의 노드별 분산 전원 투입 설정.
+## 주요 기능
 
-2. **24시간 시계열 동적 시뮬레이션 (분 단위 보간)**
-   - 사용자가 입력한 24시간 스케줄(Load, PV, Wind 패턴)을 1분 단위로 선형 보간(Linear Interpolation)하여 세밀한 조류해석 수행.
-   - 엑셀(.xlsx) 또는 CSV 파일을 업로드하여 사용자 정의 패턴 로드 가능.
+### 1. 계통 모델링
+- 154kV / 22.9kV 변전소 구조 반영
+- OLTC 1대, ESS 1대 기준 모델
+- 버스별 Load / PV / Wind 설정 가능
+- 선로 길이와 임피던스 설정 가능
 
-3. **협조 제어 알고리즘 (Coordinated Control)**
-   - **ESS 단기 응답 제어**: 전압 초과/미달 시 ESS가 즉각적으로 충·방전하여 전압 변동을 완화 (SOC 제한 고려).
-   - **OLTC 장기 응답 제어**: 전압 문제가 일정 시간(시지연, Time Delay) 지속될 경우 OLTC 탭을 조절하여 전체 계통 전압을 리셋.
+### 2. 24시간 시계열 시뮬레이션
+- 부하, PV, Wind 시간패턴 입력 및 업로드
+- 1분 또는 10분 등 시간 간격 설정 가능
+- 전압, 선로용량, ESS SOC, ESS 출력, OLTC 탭 변화 추적
 
-4. **실시간 시각화 대시보드 (Visualization)**
-   - 조류해석이 진행되는 동안 진행 상태(Progress) 인터페이스 제공.
-   - 24시간 모선별 전압 프로파일(p.u.), OLTC 탭 동작 횟수, ESS의 SOC 변화 및 충방전 출력(MW)을 `plotly` 차트로 직관적 시각화.
+### 3. 협조제어 알고리즘
+- 전압 허용범위: 기본 `0.94 ~ 1.06 p.u.`
+- 선로용량 제한: 기본 `12 MVA`
+- 상태기반 제어: `선로 혼잡 > 전압 이상`
+- 전압 제어 시 OLTC 우선, ESS 보조
+- ESS 효율 파라미터를 SOC 계산에 반영
+- 알고리즘 탭에서 주요 파라미터 수정 가능
 
----
+### 4. 자동 민감도 분석
+다음 세 가지 시나리오를 선택할 수 있습니다.
+- `부하만 증가`
+- `재생에너지 출력 증가`
+- `부하구간별 재생에너지 증가`
 
-## 🛠️ 설치 및 요구사항 (Prerequisites)
+자동 민감도 분석은 시작 배율부터 최대 배율까지 단계별로 반복 시뮬레이션을 수행하며, 각 회차에 대해 다음을 계산합니다.
+- 최소/최대 전압
+- 최대 선로용량
+- 부하/PV/WT 총합 범위
+- ESS 출력 범위
+- ESS SOC 범위
+- OLTC 탭 범위
+- 허용치 만족 여부
 
-본 프로젝트를 실행하기 위해 Python 3.8 이상의 환경이 권장됩니다.
-필요한 패키지는 `requirements.txt`에 명시되어 있으며, 추가적으로 아래의 라이브러리들이 필요합니다.
+### 5. 보고서 및 결과물
+- 단일 시나리오 결과 Excel 다운로드
+- 자동 민감도 분석 결과 Word 보고서 생성
+- 보고서에는 다음을 포함하도록 구성
+  - 계통 구성
+  - 부하/재생에너지 패턴 그래프
+  - 민감도 종합 그래프
+  - 대표 시뮬레이션 그래프
+  - 회차별 전압 및 선로용량 그래프
+  - 회차별 운영 범위
+  - 이상 결과 원인 분석 및 개선 방향
 
-```bash
-# 필수 라이브러리 설치
-pip install streamlit pandapower pandas numpy plotly openpyxl
-```
+## 실행 방법
 
----
-
-## 💻 실행 방법 (Usage)
-
-일반적인 파이썬 실행 명령어(`python DL.py`)가 아닌, **Streamlit 전용 명령어**를 사용하여 실행해야 대시보드(웹 UI)를 확인할 수 있습니다.
-
+### Streamlit UI 실행
 ```bash
 streamlit run DL.py
 ```
 
-명령어를 실행하면 자동으로 기본 웹 브라우저가 열리며 대시보드 화면이 나타납니다. 만약 창이 열리지 않는다면 터미널에 출력된 `Local URL` (예: `http://localhost:8501`)을 브라우저 주소창에 직접 입력하세요.
+### 직접 실행
+```bash
+python DL.py
+```
 
----
+### CLI 자동 분석 실행
+```bash
+python limit_finder.py
+```
 
-## 📂 파일 구조 및 핵심 로직 (Structure)
+예시:
+```bash
+python limit_finder.py --scenario renewable_increase --start-scale 1.0 --step 0.1 --max-scale 3.0
+```
 
-- `DL.py`: 메인 애플리케이션 파일입니다.
-  - **사이드바 구성**: 선로 길이, 임피던스(R+jX), OLTC 설정(민감도, 시지연 등), ESS 제어 설정 입력.
-  - **메인 화면 입력부**: DataFrame Editor를 통해 버스별 용량(MW, MVar) 및 24시간 출력 패턴(%)을 입력.
-  - **`create_dynamic_network()`**: 입력된 파라미터를 기반으로 `pandapower` 빈 네트워크(empt network)에 Bus, Line, Load, sgen, storage 등을 동적으로 생성.
-  - **Simulation Loop (1440분)**:
-    1. 각 시간대별 부하 및 재생에너지 출력 업데이트.
-    2. 조류해석(`runpp`) 1차 수행 (수렴 실패 시 기본 전압 1.0 보장).
-    3. 전압 제한 위반 시 ESS 출력 산정 및 SOC 갱신.
-    4. 조류해석 2차 수행 (ESS 개입 후).
-    5. 말단 전압을 확인하여 OLTC Time Delay 타이머 동작 및 탭 변환.
-  - **결과 플로팅**: 시뮬레이션 종료 후 수집된 데이터를 바탕으로 결과 그래프 출력.
+## 권장 패키지 설치
+```bash
+pip install streamlit pandapower pandas numpy plotly openpyxl xlsxwriter matplotlib python-docx
+```
 
----
+## 현재 알려진 제약
+- Streamlit 페이지 내부 버튼으로 실행 중 루프를 즉시 중단하는 구조는 아직 아님
+- 실제 강제 중지는 우상단 `Stop` 버튼 사용
+- 보고서 그래프 생성은 환경에 따라 `matplotlib` 설치가 필요함
+- 일부 환경에서는 `python-docx` 경로가 실패할 수 있어 fallback 경로를 함께 두고 있음
 
-## 📝 향후 업데이트 계획 (TODO)
-
-- [ ] 시뮬레이션 결과(전압 프로파일, ESS 동작 내역 등)를 엑셀 파일로 추출(Download)하는 기능 추가.
-- [ ] 다중 변전소 혹은 복조 계통(Meshed Network) 구조 지원 확장.
-- [ ] 조류해석 속도 개선을 위한 Numba 활성화 테스트 최적화.
-
----
-**Author**: [개발자 이름/아이디를 입력하세요]
-**License**: MIT License (또는 적용할 라이선스)
-
----
-
-## 📖 상세 업데이트 및 검증 가이드
-최신 업데이트 내역, 에러 수정 사항 및 시뮬레이션 검증 결과에 대한 상세 내용은 아래 문서를 참조하세요.
-
-👉 [상세 워크스루(Walkthrough) 바로가기](./docs/walkthrough.md)
-
----
-##  최신 업데이트 (2026-03-04)
-- IDE 직접 실행 시 Streamlit 자동 전환 로직 및 Numba 가속 모드 적용
-- 시뮬레이션 결과 엑셀(.xlsx) 추출 기능 구현
-👉 상세 내역 및 에러 수정 사항은 [워크스루 문서](./docs/walkthrough.md)에서 확인하세요.
+## 참고 문서
+- [walkthrough.md](./walkthrough.md)
+- [project_summary_2026-03-10.md](./project_summary_2026-03-10.md)
