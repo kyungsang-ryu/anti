@@ -216,6 +216,25 @@ def line_metrics(net) -> Tuple[Dict[str, float], float, str, float]:
     return line_map, worst_mva, worst_name, signed_p
 
 
+def _extract_voltage_stats(res_bus: pd.DataFrame) -> Tuple[float, float, int, int]:
+    if not isinstance(res_bus, pd.DataFrame) or res_bus.empty or "vm_pu" not in res_bus.columns:
+        return 1.0, 1.0, -1, -1
+    vm_series = pd.to_numeric(res_bus["vm_pu"], errors="coerce").dropna()
+    if vm_series.empty:
+        return 1.0, 1.0, -1, -1
+    min_v = float(vm_series.min())
+    max_v = float(vm_series.max())
+    try:
+        min_idx = int(vm_series.idxmin())
+    except Exception:
+        min_idx = -1
+    try:
+        max_idx = int(vm_series.idxmax())
+    except Exception:
+        max_idx = -1
+    return min_v, max_v, min_idx, max_idx
+
+
 def determine_state(prev_state: str, min_v: float, max_v: float, max_line_mva: float, config: Dict[str, float]) -> str:
     if prev_state == STATE_CONGESTION and max_line_mva > float(config["line_return_mva"]):
         return STATE_CONGESTION
@@ -1295,16 +1314,7 @@ def run_coordinated_daily_simulation(
             runpp_failure_count += 1
 
         res_bus = getattr(net, "res_bus", pd.DataFrame())
-        if "vm_pu" in res_bus.columns and not res_bus.empty:
-            pre_min_v = float(res_bus.vm_pu.min())
-            pre_max_v = float(res_bus.vm_pu.max())
-            min_v_bus_idx = int(res_bus.vm_pu.idxmin())
-            max_v_bus_idx = int(res_bus.vm_pu.idxmax())
-        else:
-            pre_min_v = 1.0
-            pre_max_v = 1.0
-            min_v_bus_idx = -1
-            max_v_bus_idx = -1
+        pre_min_v, pre_max_v, min_v_bus_idx, max_v_bus_idx = _extract_voltage_stats(res_bus)
         _, pre_line_mva, _, signed_p = line_metrics(net)
         current_state = determine_state(current_state, pre_min_v, pre_max_v, pre_line_mva, cfg)
 
@@ -1447,16 +1457,7 @@ def run_coordinated_daily_simulation(
         ess_discharge_mwh += step_discharge_mw * delta_h
 
         res_bus = getattr(net, "res_bus", pd.DataFrame())
-        if "vm_pu" in res_bus.columns and not res_bus.empty:
-            min_v = float(res_bus.vm_pu.min())
-            max_v = float(res_bus.vm_pu.max())
-            min_v_bus_idx = int(res_bus.vm_pu.idxmin())
-            max_v_bus_idx = int(res_bus.vm_pu.idxmax())
-        else:
-            min_v = 1.0
-            max_v = 1.0
-            min_v_bus_idx = -1
-            max_v_bus_idx = -1
+        min_v, max_v, min_v_bus_idx, max_v_bus_idx = _extract_voltage_stats(res_bus)
         current_line_map, line_max, line_name, signed_p = line_metrics(net)
         voltage_ok, line_ok, overall_ok = evaluate_limits(min_v, max_v, line_max, cfg)
         all_voltage_ok = all_voltage_ok and voltage_ok

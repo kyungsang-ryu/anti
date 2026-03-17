@@ -47,6 +47,7 @@ from sim_engine import (
     default_bus_dataframe,
     default_config,
     default_time_profile_dataframe,
+    normalize_time_profile_dataframe,
 )
 
 st.set_page_config(page_title="배전계통 OLTC-ESS 협조 제어 시뮬레이터", layout="wide")
@@ -182,14 +183,7 @@ def _restore_time_profile_dataframe(saved_rows):
         return None
     try:
         restored = pd.DataFrame(saved_rows)
-        template = default_time_profile_dataframe()
-        if restored.empty:
-            return template
-        for col in template.columns:
-            if col not in restored.columns:
-                default_values = template[col].tolist()
-                restored[col] = [default_values[min(i, len(default_values) - 1)] for i in range(len(restored))]
-        return restored[template.columns].copy()
+        return normalize_time_profile_dataframe(restored)
     except Exception:
         return None
 
@@ -314,6 +308,7 @@ def init_session_state():
     st.session_state.setdefault("cfg_batch_parallel", True)
     st.session_state.setdefault("cfg_batch_include_timeseries", False)
     st.session_state.setdefault("cfg_batch_max_workers", min(4, max(1, int(os.cpu_count() or 1))))
+    st.session_state["time_df"] = normalize_time_profile_dataframe(st.session_state.get("time_df"))
     normalize_bus_selection_state()
 
 
@@ -895,9 +890,22 @@ def load_uploaded_profile(disabled: bool = False):
         return
     try:
         uploaded_df = pd.read_csv(uploaded_file) if uploaded_file.name.lower().endswith(".csv") else pd.read_excel(uploaded_file)
-        st.session_state["time_df"] = uploaded_df
+        normalized_df, info = normalize_time_profile_dataframe(uploaded_df, return_info=True)
+        st.session_state["time_df"] = normalized_df
         st.session_state["uploaded_profile_signature"] = signature
         st.success("시간 패턴 파일을 반영했습니다.")
+        notice_parts = []
+        if info.get("renamed_columns"):
+            mapped = ", ".join(f"{src} -> {dst}" for src, dst in info["renamed_columns"].items())
+            notice_parts.append(f"컬럼 자동 매핑: {mapped}")
+        if info.get("defaulted_columns"):
+            defaults = ", ".join(info["defaulted_columns"])
+            notice_parts.append(f"기본 패턴 적용: {defaults}")
+        if info.get("dropped_columns"):
+            dropped = ", ".join(info["dropped_columns"])
+            notice_parts.append(f"미사용 컬럼 무시: {dropped}")
+        if notice_parts:
+            st.warning("업로드 파일을 앱 표준 시간 패턴 형식으로 정규화했습니다. " + " | ".join(notice_parts))
     except Exception as exc:
         st.error(f"파일 로드 오류: {exc}")
 
@@ -1363,7 +1371,7 @@ def main():
             st.info("시뮬레이션 실행 중에는 시간 패턴을 수정할 수 없습니다.")
         load_uploaded_profile(disabled=locked)
         edited_df_time = st.data_editor(st.session_state["time_df"], num_rows="dynamic", hide_index=True, width="stretch", key="time_editor", disabled=locked)
-        st.session_state["time_df"] = edited_df_time.copy()
+        st.session_state["time_df"] = normalize_time_profile_dataframe(edited_df_time)
 
     with tab_algo:
         render_algorithm_tab()

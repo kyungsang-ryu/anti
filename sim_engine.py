@@ -2,6 +2,8 @@
 
 import io
 import math
+import re
+import unicodedata
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -29,6 +31,58 @@ PV_P_COL = "PV_P"
 WIND_P_COL = "Wind_P"
 ESS_MAX_COL = "ESS_최대출력"
 ESS_CAP_COL = "ESS_용량"
+
+TIME_PROFILE_REQUIRED_COLS = [
+    TIME_COL,
+    LOAD_PATTERN_COL,
+    PV_PATTERN_COL,
+    WIND_PATTERN_COL,
+]
+TIME_PROFILE_COLUMN_ALIASES = {
+    TIME_COL: [TIME_COL, "시간", "시각", "hour", "hours", "time", "hr"],
+    LOAD_PATTERN_COL: [
+        LOAD_PATTERN_COL,
+        "부하",
+        "부하패턴",
+        "load",
+        "loadpattern",
+        "loadprofile",
+        "loadpct",
+        "loadpercentage",
+        "demand",
+        "demandpattern",
+    ],
+    PV_PATTERN_COL: [
+        PV_PATTERN_COL,
+        "태양광",
+        "태양광패턴",
+        "pv",
+        "pvpattern",
+        "pvprofile",
+        "solar",
+        "solarpattern",
+        "solarprofile",
+    ],
+    WIND_PATTERN_COL: [
+        WIND_PATTERN_COL,
+        "풍력",
+        "풍력패턴",
+        "wind",
+        "windpattern",
+        "windprofile",
+    ],
+}
+
+
+def _normalize_profile_column_key(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value).strip().lower())
+    return re.sub(r"[^0-9a-z가-힣]+", "", text)
+
+
+TIME_PROFILE_ALIAS_LOOKUP = {
+    canonical: {_normalize_profile_column_key(alias) for alias in aliases}
+    for canonical, aliases in TIME_PROFILE_COLUMN_ALIASES.items()
+}
 
 
 def default_config() -> Dict[str, float]:
@@ -148,6 +202,88 @@ def format_minute(minute: int) -> str:
     return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
+def _default_time_profile_series(column: str, row_count: int) -> pd.Series:
+    template = default_time_profile_dataframe()
+    if row_count <= 0:
+        return pd.Series(dtype=float)
+    values = template[column].tolist()
+    return pd.Series([values[min(i, len(values) - 1)] for i in range(row_count)])
+
+
+def normalize_time_profile_dataframe(
+    time_df: pd.DataFrame,
+    return_info: bool = False,
+) -> pd.DataFrame | Tuple[pd.DataFrame, Dict[str, Any]]:
+    info: Dict[str, Any] = {
+        "renamed_columns": {},
+        "defaulted_columns": [],
+        "dropped_columns": [],
+    }
+    template = default_time_profile_dataframe()
+
+    if not isinstance(time_df, pd.DataFrame) or time_df.empty:
+        normalized = template.copy()
+        if return_info:
+            info["defaulted_columns"] = TIME_PROFILE_REQUIRED_COLS.copy()
+            return normalized, info
+        return normalized
+
+    working = time_df.copy()
+    working.columns = [str(col).strip() for col in working.columns]
+    row_count = len(working)
+    original_columns = list(working.columns)
+    normalized_keys = {col: _normalize_profile_column_key(col) for col in working.columns}
+
+    rename_map: Dict[str, str] = {}
+    reserved_sources: set[str] = set()
+    for canonical in TIME_PROFILE_REQUIRED_COLS:
+        if canonical in working.columns:
+            reserved_sources.add(canonical)
+            continue
+        alias_keys = TIME_PROFILE_ALIAS_LOOKUP[canonical]
+        matched_col = next(
+            (
+                col
+                for col in working.columns
+                if col not in reserved_sources and normalized_keys.get(col, "") in alias_keys
+            ),
+            None,
+        )
+        if matched_col is not None:
+            rename_map[matched_col] = canonical
+            reserved_sources.add(matched_col)
+
+    if rename_map:
+        working = working.rename(columns=rename_map)
+        info["renamed_columns"] = rename_map.copy()
+
+    normalized = pd.DataFrame(index=range(row_count))
+    default_time = _default_time_profile_series(TIME_COL, row_count)
+
+    if TIME_COL in working.columns:
+        time_values = pd.to_numeric(working[TIME_COL], errors="coerce")
+        normalized[TIME_COL] = time_values.where(time_values.notna(), default_time)
+    else:
+        info["defaulted_columns"].append(TIME_COL)
+        normalized[TIME_COL] = default_time
+
+    for col in [LOAD_PATTERN_COL, PV_PATTERN_COL, WIND_PATTERN_COL]:
+        default_values = _default_time_profile_series(col, row_count)
+        if col in working.columns:
+            numeric_values = pd.to_numeric(working[col], errors="coerce")
+            normalized[col] = numeric_values.where(numeric_values.notna(), default_values)
+        else:
+            info["defaulted_columns"].append(col)
+            normalized[col] = default_values
+
+    recognized_sources = set(rename_map.keys()) | set(TIME_PROFILE_REQUIRED_COLS)
+    info["dropped_columns"] = [col for col in original_columns if col not in recognized_sources]
+
+    if return_info:
+        return normalized[TIME_PROFILE_REQUIRED_COLS].copy(), info
+    return normalized[TIME_PROFILE_REQUIRED_COLS].copy()
+
+
 def _build_time_grid(total_minutes: int, time_step_mins: int) -> list[int]:
     if time_step_mins <= 0:
         raise ValueError("time_step_mins must be > 0")
@@ -193,15 +329,10 @@ def prepare_time_profile(
     total_minutes: int = 24 * 60,
     time_step_mins: int = 1,
 ) -> pd.DataFrame:
-    working = time_df.copy()
-    if TIME_COL in working.columns:
-        working[MINUTE_COL] = pd.to_numeric(working[TIME_COL], errors="coerce").fillna(0.0) * 60.0
-    else:
-        working[MINUTE_COL] = np.arange(len(working)) * 60.0
+    working = normalize_time_profile_dataframe(time_df).copy()
+    working[MINUTE_COL] = pd.to_numeric(working[TIME_COL], errors="coerce").fillna(0.0) * 60.0
 
     for col in [LOAD_PATTERN_COL, PV_PATTERN_COL, WIND_PATTERN_COL]:
-        if col not in working.columns:
-            working[col] = 0.0
         working[col] = pd.to_numeric(working[col], errors="coerce")
 
     working[MINUTE_COL] = pd.to_numeric(working[MINUTE_COL], errors="coerce").fillna(0.0).astype(int)
@@ -899,6 +1030,5 @@ def _build_docx_bytes(title: str, paragraphs: list[str]) -> bytes:
         zf.writestr("_rels/.rels", rels)
         zf.writestr("word/document.xml", document_xml)
     return buffer.getvalue()
-
 
 
