@@ -14,8 +14,25 @@ from xml.sax.saxutils import escape
 import numpy as np
 import pandas as pd
 
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+try:
+    import docx
+    from docx import Document
+    from docx.shared import Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+
 from sim_engine import (
-    BUS_COUNT,
     ESS_CAP_COL,
     ESS_MAX_COL,
     LOAD_P_COL,
@@ -81,6 +98,21 @@ CONTROL_CASE_LABELS = {
     CONTROL_CASE_OLTC_ESS: "OLTC + ESS",
 }
 
+RUN_DETAIL_EXPORT_MAP = [
+    ("V", "df_v"),
+    ("Tap", "df_tap"),
+    ("SOC", "df_soc"),
+    ("ESS_P", "df_ess_p"),
+    ("ESS_Q", "df_ess_q"),
+    ("MinV", "df_min_v"),
+    ("MaxV", "df_max_v"),
+    ("State", "df_state"),
+    ("LineMax", "df_line_mva_max"),
+    ("LineAll", "df_line_mva"),
+    ("Profile", "df_profile"),
+    ("Totals", "df_totals"),
+]
+
 
 def scenario_label(scenario: str) -> str:
     labels = {
@@ -120,9 +152,10 @@ def advanced_config(config: Dict[str, float]) -> Dict[str, float]:
 def prepare_single_ess_bus_df(bus_df: pd.DataFrame, config: Dict[str, float]) -> pd.DataFrame:
     # ESS는 한 대만 사용하므로 입력 데이터와 무관하게 선택한 버스 한 곳에만 용량을 배치한다.
     normalized = _normalize_bus_dataframe(bus_df)
+    bus_count = len(normalized)
     normalized[ESS_MAX_COL] = 0.0
     normalized[ESS_CAP_COL] = 0.0
-    bus_number = int(max(1, min(BUS_COUNT, int(config.get("ess_bus_number", BUS_COUNT)))))
+    bus_number = int(max(1, min(bus_count, int(config.get("ess_bus_number", bus_count)))))
     normalized.at[bus_number - 1, ESS_MAX_COL] = max(0.0, float(config.get("ess_power_mw", 5.0)))
     normalized.at[bus_number - 1, ESS_CAP_COL] = max(0.0, float(config.get("ess_capacity_mwh", 15.0)))
     return normalized
@@ -205,6 +238,17 @@ def ramp_to_zero(value: float, ramp_limit: float) -> float:
     return value - math.copysign(ramp_limit, value)
 
 
+def ramp_to_target(current: float, target: float, ramp_limit: float) -> float:
+    delta = float(target) - float(current)
+    if abs(delta) <= ramp_limit:
+        return float(target)
+    return float(current + math.copysign(ramp_limit, delta))
+
+
+def _ramp_command_vector(current_values: list[float], target_values: list[float], ramp_limit: float) -> list[float]:
+    return [ramp_to_target(current, target, ramp_limit) for current, target in zip(current_values, target_values)]
+
+
 def _distribute_total(total: float, caps: list[float], weights: Optional[list[float]] = None) -> list[float]:
     n = len(caps)
     if n == 0:
@@ -262,7 +306,7 @@ def build_analysis_excel_bytes(sim_results: Dict[str, pd.DataFrame]) -> bytes:
         try:
             buffer.seek(0)
             buffer.truncate(0)
-            writer = pd.ExcelWriter(buffer) if engine is None else pd.ExcelWriter(buffer, engine=engine)
+            writer = pd.ExcelWriter(buffer, engine=engine) if engine else pd.ExcelWriter(buffer)
             with writer:
                 for sheet_name, key in [
                     ("Voltage_PU", "df_v"),
@@ -285,6 +329,80 @@ def build_analysis_excel_bytes(sim_results: Dict[str, pd.DataFrame]) -> bytes:
             last_error = exc
             continue
     raise RuntimeError("Excel 파일 생성에 실패했습니다.") from last_error
+
+
+def build_all_scenarios_excel_bytes(search_result: Dict[str, Any]) -> bytes:
+    """모든 시나리오 실행 결과를 하나의 엑셀 파일로 취합하여 반환한다."""
+    run_details = search_result.get("run_details", [])
+    runs = search_result.get("runs", [])
+    
+    buffer = io.BytesIO()
+    try:
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            # 1. 종합 요약 시트
+            summary_df = pd.DataFrame(runs)
+            summary_df.to_excel(writer, sheet_name="Summary_Overview", index=False)
+            
+            # 2. 각 회차별 상세 시계열 데이터
+            for run_idx, run_detail in enumerate(run_details, start=1):
+                pct = float(run_detail.get("sweep_percent", 0.0))
+                pct_tag = f"{pct:.1f}".replace(".", "p")
+                sheet_prefix = f"R{run_idx:02d}_{pct_tag}"
+
+                results = run_detail.get("results", {})
+                for sheet_suffix, key in RUN_DETAIL_EXPORT_MAP:
+                    df = results.get(key, pd.DataFrame()) if isinstance(results, dict) else pd.DataFrame()
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        sheet_name = f"{sheet_prefix}_{sheet_suffix}"[:31]
+                        df.to_excel(writer, sheet_name=sheet_name)
+                        
+        return buffer.getvalue()
+    except Exception as exc:
+        # xlsxwriter 실패 시 fallback 없이 에러 반환 (보통 pandas 환경이면 설치되어 있음)
+        raise RuntimeError(f"통합 엑셀 생성 실패: {exc}")
+
+
+def build_batch_detailed_excel_bytes(batch_result: Dict[str, Any]) -> bytes:
+    """배치 실행의 시나리오별 상세 시계열 로그를 통합 엑셀로 내보낸다."""
+    summary_df = pd.DataFrame(batch_result.get("summary_records", []))
+    aggregate_df = batch_result.get("aggregate_df", pd.DataFrame())
+    detailed_outputs = list(batch_result.get("detailed_outputs", []))
+    if not detailed_outputs:
+        raise ValueError("No detailed batch outputs available. Re-run with include_timeseries=True.")
+
+    buffer = io.BytesIO()
+    try:
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            if not summary_df.empty:
+                summary_df.to_excel(writer, sheet_name="BatchSummary", index=False)
+            if isinstance(aggregate_df, pd.DataFrame) and not aggregate_df.empty:
+                aggregate_df.to_excel(writer, sheet_name="Aggregate", index=False)
+
+            scenario_rows: list[Dict[str, Any]] = []
+            for output in detailed_outputs:
+                scenario = dict(output.get("scenario", {}))
+                summary = dict(output.get("summary", {}))
+                if scenario or summary:
+                    row = dict(scenario)
+                    for key, value in summary.items():
+                        row.setdefault(f"summary_{key}", value)
+                    scenario_rows.append(row)
+
+                scenario_id = str(scenario.get("scenario_id", summary.get("scenario_id", "SCN"))).replace(" ", "_")
+                results = output.get("results", {})
+                if not isinstance(results, dict):
+                    continue
+                for sheet_suffix, key in RUN_DETAIL_EXPORT_MAP:
+                    df = results.get(key, pd.DataFrame())
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        sheet_name = f"{scenario_id}_{sheet_suffix}"[:31]
+                        df.to_excel(writer, sheet_name=sheet_name)
+
+            if scenario_rows:
+                pd.DataFrame(scenario_rows).to_excel(writer, sheet_name="ScenarioMeta", index=False)
+        return buffer.getvalue()
+    except Exception as exc:
+        raise RuntimeError(f"Batch detailed excel generation failed: {exc}")
 
 
 
@@ -408,15 +526,15 @@ def _expand_control_cases(spec: Any, default: list[str]) -> list[str]:
     return _stable_text_list(normalized)
 
 
-def _expand_location_values(spec: Any, default: list[int]) -> list[int]:
+def _expand_location_values(spec: Any, default: list[int], bus_count: int) -> list[int]:
     values = _expand_scenario_values(spec, [float(v) for v in default])
     locations: list[int] = []
     for value in values:
         rounded = int(round(float(value)))
         if abs(float(value) - rounded) > 1e-9:
             raise ValueError("ESS_location must be an integer bus number")
-        if rounded < 1 or rounded > BUS_COUNT:
-            raise ValueError(f"ESS_location must be between 1 and {BUS_COUNT}")
+        if rounded < 1 or rounded > bus_count:
+            raise ValueError(f"ESS_location must be between 1 and {bus_count}")
         locations.append(rounded)
     return _stable_int_list(locations)
 
@@ -521,7 +639,7 @@ def _finalize_generated_scenarios(mode: str, scenarios: list[Dict[str, Any]]) ->
     return filtered
 
 
-def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
+def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None, bus_count: int = 7) -> list[Dict[str, Any]]:
     if settings is None:
         if not isinstance(mode, dict):
             raise ValueError("generate_scenarios requires either (mode, settings) or a settings dict containing 'mode'")
@@ -529,7 +647,7 @@ def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None) -> 
         mode = settings.get("mode", SCENARIO_MODE_HOSTING_CAPACITY)
     settings = dict(settings or {})
     mode_key = str(mode or settings.get("mode", SCENARIO_MODE_HOSTING_CAPACITY))
-    default_location = int(settings.get("default_ess_location", BUS_COUNT))
+    default_location = int(settings.get("default_ess_location", 5))
 
     if mode_key == SCENARIO_MODE_HOSTING_CAPACITY:
         pv_values = sorted(_expand_scenario_values(settings.get("pv_penetration", settings.get("PV_penetration")), [1.0]))
@@ -543,7 +661,7 @@ def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None) -> 
             raise ValueError("Load_growth must be > 0")
         if ess_size < 0.0:
             raise ValueError("ESS_size must be >= 0")
-        ess_location = int(_require_single_value(_expand_location_values(settings.get("ess_location", default_location), [default_location]), "ESS_location", mode_key))
+        ess_location = int(_require_single_value(_expand_location_values(settings.get("ess_location", default_location), [default_location], bus_count=bus_count), "ESS_location", mode_key))
         control_cases = _expand_control_cases(settings.get("control_case", CONTROL_CASE_OLTC_ESS), [CONTROL_CASE_OLTC_ESS])
         scenarios = []
         for control_case in control_cases:
@@ -573,7 +691,7 @@ def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None) -> 
         ess_size = float(_require_single_value(_expand_scenario_values(settings.get("ess_size", settings.get("ESS_size", 1.0)), [1.0]), "ESS_size", mode_key))
         if ess_size < 0.0:
             raise ValueError("ESS_size must be >= 0")
-        ess_location = int(_require_single_value(_expand_location_values(settings.get("ess_location", default_location), [default_location]), "ESS_location", mode_key))
+        ess_location = int(_require_single_value(_expand_location_values(settings.get("ess_location", default_location), [default_location], bus_count=bus_count), "ESS_location", mode_key))
         control_case = str(_require_single_value(_expand_control_cases(settings.get("control_case", CONTROL_CASE_OLTC_ESS), [CONTROL_CASE_OLTC_ESS]), "control_case", mode_key))
         effective_ess_size = ess_size if control_case == CONTROL_CASE_OLTC_ESS else 0.0
         scenarios = []
@@ -594,7 +712,7 @@ def generate_scenarios(mode: Any, settings: Optional[Dict[str, Any]] = None) -> 
         base_pv_penetration = float(_require_single_value(_expand_scenario_values(settings.get("base_pv_penetration", settings.get("pv_penetration", 1.0)), [1.0]), "PV_penetration", mode_key))
         base_load_growth = float(_require_single_value(_expand_scenario_values(settings.get("base_load_growth", settings.get("load_growth", 1.0)), [1.0]), "Load_growth", mode_key))
         ess_sizes = sorted(_expand_scenario_values(settings.get("ess_size", settings.get("ESS_size", [0.0, 1.0])), [0.0, 1.0]))
-        ess_locations = _expand_location_values(settings.get("ess_location", default_location), [default_location])
+        ess_locations = _expand_location_values(settings.get("ess_location", default_location), [default_location], bus_count=bus_count)
         if base_pv_penetration < 0.0:
             raise ValueError("PV_penetration must be >= 0")
         if base_load_growth <= 0.0:
@@ -656,9 +774,9 @@ def build_scenario_preview_df(scenarios: list[Dict[str, Any]]) -> pd.DataFrame:
 
 
 
-def _scenario_workflow_example_cases(config: Optional[Dict[str, float]] = None) -> Dict[str, list[Dict[str, Any]]]:
+def _scenario_workflow_example_cases(config: Optional[Dict[str, float]] = None, bus_count: int = 7) -> Dict[str, list[Dict[str, Any]]]:
     cfg = advanced_config(config or {})
-    default_location = int(cfg.get("ess_bus_number", BUS_COUNT))
+    default_location = int(cfg.get("ess_bus_number", 5))
     example_power = max(float(cfg.get("ess_power_mw", 0.0)), 5.0)
     example_capacity = max(float(cfg.get("ess_capacity_mwh", 0.0)), 15.0)
     shared = {
@@ -677,6 +795,7 @@ def _scenario_workflow_example_cases(config: Optional[Dict[str, float]] = None) 
                 "ess_location": default_location,
                 "control_case": CONTROL_CASE_OLTC_ESS,
             },
+            bus_count=bus_count,
         ),
         SCENARIO_MODE_LOAD_PV_MAP: generate_scenarios(
             SCENARIO_MODE_LOAD_PV_MAP,
@@ -688,6 +807,7 @@ def _scenario_workflow_example_cases(config: Optional[Dict[str, float]] = None) 
                 "ess_location": default_location,
                 "control_case": CONTROL_CASE_OLTC_ESS,
             },
+            bus_count=bus_count,
         ),
         SCENARIO_MODE_ESS_SIZING: generate_scenarios(
             SCENARIO_MODE_ESS_SIZING,
@@ -700,6 +820,7 @@ def _scenario_workflow_example_cases(config: Optional[Dict[str, float]] = None) 
                 "control_case": CONTROL_CASE_OLTC_ESS,
                 "base_stress_case": "PV 1.60, Load 1.00",
             },
+            bus_count=bus_count,
         ),
     }
 
@@ -723,8 +844,8 @@ def _scenario_flow_example_text(mode: str, scenarios: list[Dict[str, Any]]) -> s
     )
 
 
-def scenario_workflow_lines(config: Optional[Dict[str, float]] = None) -> list[str]:
-    examples = _scenario_workflow_example_cases(config)
+def scenario_workflow_lines(config: Optional[Dict[str, float]] = None, bus_count: int = 7) -> list[str]:
+    examples = _scenario_workflow_example_cases(config, bus_count=bus_count)
     return [
         "연구형 배치 시나리오는 무작위 조합이 아니라 연구 질문별 mode로 생성합니다.",
         "공통 흐름: 기준 설정 확정 -> mode별 가변 변수 선택 -> 유효성 검사 및 중복 제거 -> SCN 번호 부여 -> 미리보기 -> 시나리오별 독립 실행 -> 요약 집계",
@@ -742,7 +863,7 @@ def _prepare_scenario_inputs(
     scenario: Optional[Dict[str, Any]],
 ) -> tuple[Dict[str, float], pd.DataFrame, Dict[str, Any]]:
     scenario_config = advanced_config(config)
-    default_location = int(scenario_config.get("ess_bus_number", BUS_COUNT))
+    default_location = int(scenario_config.get("ess_bus_number", 5))
     scenario_data = {
         "scenario_id": "SCN_BASE",
         "mode": SCENARIO_MODE_HOSTING_CAPACITY,
@@ -800,7 +921,7 @@ def _summarize_single_run(
         "control_case_label": str(scenario_data.get("control_case_label", control_case_label(str(scenario_data.get("control_case", CONTROL_CASE_OLTC_ESS))))),
         "PV_penetration": float(scenario_data.get("PV_penetration", 1.0)),
         "ESS_size": float(scenario_data.get("ESS_size", 1.0)),
-        "ESS_location": int(scenario_data.get("ESS_location", scenario_config.get("ess_bus_number", BUS_COUNT))),
+        "ESS_location": int(scenario_data.get("ESS_location", scenario_config.get("ess_bus_number", len(scenario_bus_df)))),
         "Load_growth": float(scenario_data.get("Load_growth", 1.0)),
         "base_stress_case": str(scenario_data.get("base_stress_case", "")),
         "scenario_label": str(scenario_data.get("scenario_label", "")),
@@ -1106,17 +1227,18 @@ def run_coordinated_daily_simulation(
     load_scale = float(load_scale)
     renewable_scale = float(renewable_scale)
     ramp_rate = float(cfg["ess_ramp_rate_mw_per_min"])
+    bus_count = len(bus_data)
 
-    bus_map = {i + 1: int(net.bus.index[net.bus.name == f"Bus {i + 1}"][0]) for i in range(BUS_COUNT)}
-    pv_indices = [int(net.sgen[net.sgen.name == f"PV_{i + 1}"].index[0]) for i in range(BUS_COUNT)]
-    wind_indices = [int(net.sgen[net.sgen.name == f"Wind_{i + 1}"].index[0]) for i in range(BUS_COUNT)]
-    storage_indices = [int(net.storage[net.storage.name == f"ESS_{i + 1}"].index[0]) for i in range(BUS_COUNT)]
+    bus_map = {i + 1: int(net.bus.index[net.bus.name == f"Bus {i + 1}"][0]) for i in range(bus_count)}
+    pv_indices = [int(net.sgen[net.sgen.name == f"PV_{i + 1}"].index[0]) for i in range(bus_count)]
+    wind_indices = [int(net.sgen[net.sgen.name == f"Wind_{i + 1}"].index[0]) for i in range(bus_count)]
+    storage_indices = [int(net.storage[net.storage.name == f"ESS_{i + 1}"].index[0]) for i in range(bus_count)]
     bus_lookup = {int(idx): str(name) for idx, name in net.bus["name"].items()}
 
-    history_v = {f"Bus {i}": [] for i in range(1, BUS_COUNT + 1)}
-    history_soc = {f"Bus {i}": [] for i in range(1, BUS_COUNT + 1)}
-    history_ess_p = {f"Bus {i}": [] for i in range(1, BUS_COUNT + 1)}
-    history_ess_q = {f"Bus {i}": [] for i in range(1, BUS_COUNT + 1)}
+    history_v = {f"Bus {i}": [] for i in range(1, bus_count + 1)}
+    history_soc = {f"Bus {i}": [] for i in range(1, bus_count + 1)}
+    history_ess_p = {f"Bus {i}": [] for i in range(1, bus_count + 1)}
+    history_ess_q = {f"Bus {i}": [] for i in range(1, bus_count + 1)}
     history_tap = []
     history_min_v = []
     history_max_v = []
@@ -1127,9 +1249,9 @@ def run_coordinated_daily_simulation(
     history_totals = []
 
     current_tap = 0
-    current_soc = [float(cfg["ess_init_soc"]) if float(bus_data.at[i, ESS_CAP_COL]) > 0.0 else 0.0 for i in range(BUS_COUNT)]
-    current_p_cmd = [0.0] * BUS_COUNT
-    current_q_cmd = [0.0] * BUS_COUNT
+    current_soc = [float(cfg["ess_init_soc"]) if float(bus_data.at[i, ESS_CAP_COL]) > 0.0 else 0.0 for i in range(bus_count)]
+    current_p_cmd = [0.0] * bus_count
+    current_q_cmd = [0.0] * bus_count
     current_state = STATE_NORMAL
     oltc_timer_mins = 0.0
     recover_timer_mins = 0.0
@@ -1158,7 +1280,7 @@ def run_coordinated_daily_simulation(
         pv_pct = pv_pct_raw / 100.0 * renewable_scale
         wind_pct = wind_pct_raw / 100.0 * renewable_scale
 
-        for i in range(BUS_COUNT):
+        for i in range(bus_count):
             net.load.at[i, "p_mw"] = float(bus_data.at[i, LOAD_P_COL]) * load_pct
             net.load.at[i, "q_mvar"] = float(bus_data.at[i, LOAD_Q_COL]) * load_pct
             net.sgen.at[pv_indices[i], "p_mw"] = float(bus_data.at[i, PV_P_COL]) * pv_pct
@@ -1169,7 +1291,7 @@ def run_coordinated_daily_simulation(
             net.storage.at[storage_indices[i], "q_mvar"] = -current_q_cmd[i]
 
         net.trafo.at[0, "tap_pos"] = current_tap
-        if not _safe_runpp(net):
+        if not _safe_runpp(net, is_first=(step_idx == 0)):
             runpp_failure_count += 1
 
         res_bus = getattr(net, "res_bus", pd.DataFrame())
@@ -1186,8 +1308,8 @@ def run_coordinated_daily_simulation(
         _, pre_line_mva, _, signed_p = line_metrics(net)
         current_state = determine_state(current_state, pre_min_v, pre_max_v, pre_line_mva, cfg)
 
-        ess_caps = [float(bus_data.at[i, ESS_MAX_COL]) if ess_enabled else 0.0 for i in range(BUS_COUNT)]
-        ess_weights = [i + 1 for i in range(BUS_COUNT)]
+        ess_caps = [float(bus_data.at[i, ESS_MAX_COL]) if ess_enabled else 0.0 for i in range(bus_count)]
+        ess_weights = [i + 1 for i in range(bus_count)]
 
         if current_state == STATE_CONGESTION:
             if ess_enabled:
@@ -1195,11 +1317,13 @@ def run_coordinated_daily_simulation(
                 p_target = min(sum(ess_caps), overload * float(cfg["line_relief_gain"]))
                 if signed_p < 0.0:
                     p_target *= -1.0
-                current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
-                current_q_cmd = [ramp_to_zero(v, ramp_limit) for v in current_q_cmd]
+                target_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
+                target_q_cmd = [0.0] * bus_count
+                current_p_cmd = _ramp_command_vector(current_p_cmd, target_p_cmd, ramp_limit)
+                current_q_cmd = _ramp_command_vector(current_q_cmd, target_q_cmd, ramp_limit)
             else:
-                current_p_cmd = [0.0] * BUS_COUNT
-                current_q_cmd = [0.0] * BUS_COUNT
+                current_p_cmd = [0.0] * bus_count
+                current_q_cmd = [0.0] * bus_count
             if oltc_enabled:
                 if pre_max_v > float(cfg["voltage_max_limit"]) and current_tap < 8:
                     oltc_timer_mins += delta_mins
@@ -1221,11 +1345,13 @@ def run_coordinated_daily_simulation(
                 deficit = max(0.0, float(cfg["voltage_min_limit"]) - pre_min_v)
                 p_target = min(sum(ess_caps), deficit * float(cfg["ess_p_gain"]))
                 q_target = min(sum(ess_caps), deficit * float(cfg["ess_q_gain"]))
-                current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
-                current_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
+                target_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
+                target_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
+                current_p_cmd = _ramp_command_vector(current_p_cmd, target_p_cmd, ramp_limit)
+                current_q_cmd = _ramp_command_vector(current_q_cmd, target_q_cmd, ramp_limit)
             else:
-                current_p_cmd = [0.0] * BUS_COUNT
-                current_q_cmd = [0.0] * BUS_COUNT
+                current_p_cmd = [0.0] * bus_count
+                current_q_cmd = [0.0] * bus_count
             if oltc_enabled and current_tap > -8:
                 oltc_timer_mins += delta_mins
                 if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
@@ -1239,11 +1365,13 @@ def run_coordinated_daily_simulation(
                 excess = max(0.0, pre_max_v - float(cfg["voltage_max_limit"]))
                 p_target = -min(sum(ess_caps), excess * float(cfg["ess_p_gain"]))
                 q_target = -min(sum(ess_caps), excess * float(cfg["ess_q_gain"]))
-                current_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
-                current_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
+                target_p_cmd = _distribute_total(p_target, ess_caps, ess_weights)
+                target_q_cmd = _distribute_total(q_target, ess_caps, ess_weights)
+                current_p_cmd = _ramp_command_vector(current_p_cmd, target_p_cmd, ramp_limit)
+                current_q_cmd = _ramp_command_vector(current_q_cmd, target_q_cmd, ramp_limit)
             else:
-                current_p_cmd = [0.0] * BUS_COUNT
-                current_q_cmd = [0.0] * BUS_COUNT
+                current_p_cmd = [0.0] * bus_count
+                current_q_cmd = [0.0] * bus_count
             if oltc_enabled and current_tap < 8:
                 oltc_timer_mins += delta_mins
                 if oltc_timer_mins >= float(cfg["oltc_delay_mins"]):
@@ -1254,11 +1382,13 @@ def run_coordinated_daily_simulation(
             recover_timer_mins = 0.0
         else:
             if ess_enabled:
-                current_p_cmd = [ramp_to_zero(v, ramp_limit) for v in current_p_cmd]
-                current_q_cmd = [ramp_to_zero(v, ramp_limit) for v in current_q_cmd]
+                target_p_cmd = [0.0] * bus_count
+                target_q_cmd = [0.0] * bus_count
+                current_p_cmd = _ramp_command_vector(current_p_cmd, target_p_cmd, ramp_limit)
+                current_q_cmd = _ramp_command_vector(current_q_cmd, target_q_cmd, ramp_limit)
             else:
-                current_p_cmd = [0.0] * BUS_COUNT
-                current_q_cmd = [0.0] * BUS_COUNT
+                current_p_cmd = [0.0] * bus_count
+                current_q_cmd = [0.0] * bus_count
             if oltc_enabled:
                 oltc_timer_mins = 0.0
                 recover_timer_mins += delta_mins
@@ -1273,7 +1403,7 @@ def run_coordinated_daily_simulation(
                 oltc_timer_mins = 0.0
                 recover_timer_mins = 0.0
 
-        for i in range(BUS_COUNT):
+        for i in range(bus_count):
             ess_max = float(bus_data.at[i, ESS_MAX_COL])
             ess_cap = float(bus_data.at[i, ESS_CAP_COL])
             soc = current_soc[i]
@@ -1290,7 +1420,7 @@ def run_coordinated_daily_simulation(
                 current_p_cmd[i] = 0.0
                 current_q_cmd[i] = 0.0
 
-        for i in range(BUS_COUNT):
+        for i in range(bus_count):
             net.storage.at[storage_indices[i], "p_mw"] = -current_p_cmd[i]
             net.storage.at[storage_indices[i], "q_mvar"] = -current_q_cmd[i]
         net.trafo.at[0, "tap_pos"] = current_tap
@@ -1299,7 +1429,7 @@ def run_coordinated_daily_simulation(
 
         step_charge_mw = 0.0
         step_discharge_mw = 0.0
-        for i in range(BUS_COUNT):
+        for i in range(bus_count):
             ess_cap = float(bus_data.at[i, ESS_CAP_COL])
             p_cmd = float(current_p_cmd[i])
             if ess_cap <= 0.0 or abs(p_cmd) < 1e-9:
@@ -1369,7 +1499,7 @@ def run_coordinated_daily_simulation(
                 },
             }
 
-        for i in range(BUS_COUNT):
+        for i in range(bus_count):
             history_v[f"Bus {i + 1}"].append(_get_bus_voltage(net, bus_map[i + 1]))
             history_soc[f"Bus {i + 1}"].append(current_soc[i] if float(bus_data.at[i, ESS_CAP_COL]) > 0.0 else np.nan)
             history_ess_p[f"Bus {i + 1}"].append(current_p_cmd[i])
@@ -1517,7 +1647,7 @@ def _compact_run_detail(run_info: Dict[str, Any], results: Dict[str, pd.DataFram
     # 보고서에서 각 회차별 전압/선로/OLTC/ESS 그래프를 만들 수 있도록 필요한 시계열만 별도로 보관한다.
     compact = dict(run_info)
     compact["results"] = {}
-    for key in ["df_min_v", "df_max_v", "df_line_mva_max", "df_tap", "df_ess_p"]:
+    for _, key in RUN_DETAIL_EXPORT_MAP:
         df = results.get(key, pd.DataFrame())
         compact["results"][key] = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     compact["events"] = {
@@ -1666,7 +1796,10 @@ def _report_lines(search_result: Dict[str, Any]) -> list[str]:
         "",
         "연구형 시나리오 생성 및 진행 방식",
     ]
-    lines.extend(scenario_workflow_lines(search_result.get("config", {})))
+    bus_count_val = 7
+    if bus_df is not None and hasattr(bus_df, "empty") and not bus_df.empty:
+        bus_count_val = len(bus_df)
+    lines.extend(scenario_workflow_lines(search_result.get("config", {}), bus_count=bus_count_val))
     lines.extend(["", "계통 기본 구성"])
     if isinstance(bus_df, pd.DataFrame) and not bus_df.empty:
         for _, row in bus_df.iterrows():
@@ -1707,6 +1840,19 @@ def _report_lines(search_result: Dict[str, Any]) -> list[str]:
         if idx < len(run_details):
             for item in _run_evaluation_lines(run_details[idx], search_result):
                 lines.append(item)
+
+    lines.append("")
+    lines.append("🤖 [AI 자동 분석 종합 제언]")
+    if first_failure:
+        fail_scale = float(first_failure['sweep_percent'])
+        lines.append(f"분석 결과, 시나리오 배율 {fail_scale:.1f}% 이전까지는 도입된 제어 알고리즘(OLTC 및 ESS 운영)을 통해 계통의 전압과 선로용량이 모두 안정적인 허용 범위 내로 유지되었습니다.")
+        lines.append(f"그러나 배율이 {fail_scale:.1f}%에 도달하면서부터는 ESS의 출력 보상 한계 또는 OLTC의 탭 조정 한계에 도달하여, 계통 전압 기준({float(limits.get('voltage_min', 0.94)):.3f}~{float(limits.get('voltage_max', 1.06)):.3f} p.u.)이나 선로용량({float(limits.get('line_limit_mva', 12.0)):.2f} MVA) 범위를 초과하는 현상이 발생했습니다.")
+        lines.append("따라서, 현재 계통 인프라 수준에서 안정적인 운영을 보장할 수 있는 최대 수용성/부하 한계는 본 실패 지점 직전 단계로 평가됩니다.")
+        lines.append("추가적인 수용성 확보를 위해서는 ESS 용량 증설, 선로 보강, 또는 OLTC의 운영 범위 재설정과 같은 물리적 계통 보완 검토를 권장합니다.")
+    else:
+        max_scale_pct = float(search_result.get('max_scale', 3.0)) * 100
+        lines.append(f"분석 결과, 시뮬레이션 된 최대 배율 범위({max_scale_pct:.1f}%) 전체 구간에 걸쳐 도입된 최적 제어 알고리즘이 성공적으로 동작했습니다.")
+        lines.append("전압 변동성과 선로 혼잡이 적극적으로 해소되어, 해당 구간에서 추가적인 물리적 인프라 보강 없이도 계통의 안정성이 충분히 규명되었습니다.")
 
     lines.append("")
     lines.append("제어기 동작 요약")
@@ -1781,11 +1927,12 @@ def _abnormal_diagnosis(search_result: Dict[str, Any]) -> list[str]:
     return diagnosis
 
 def _render_topology_png(bus_df: pd.DataFrame) -> bytes:
-    import matplotlib.pyplot as plt
-
+    if not HAS_MATPLOTLIB:
+        return None
     fig, ax = plt.subplots(figsize=(10, 2.2))
     ax.axis("off")
-    xs = [0.05, 0.23, 0.41, 0.59, 0.77, 0.95]
+    total_nodes = 1 + len(bus_df)
+    xs = np.linspace(0.05, 0.95, total_nodes).tolist()
     labels = ["Substation\nOLTC"]
     for _, row in bus_df.iterrows():
         comps = []
@@ -1809,10 +1956,11 @@ def _render_topology_png(bus_df: pd.DataFrame) -> bytes:
 
 
 def _render_profile_png(last_results: Dict[str, pd.DataFrame]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     df_profile = last_results.get("df_profile", pd.DataFrame()) if last_results else pd.DataFrame()
     if df_profile.empty:
         return None
-    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8.5, 3.2))
     x = range(len(df_profile))
@@ -1831,10 +1979,11 @@ def _render_profile_png(last_results: Dict[str, pd.DataFrame]) -> Optional[bytes
 
 
 def _render_sensitivity_png(search_result: Dict[str, Any]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     runs_df = pd.DataFrame(search_result.get("runs", []))
     if runs_df.empty:
         return None
-    import matplotlib.pyplot as plt
 
     fig, ax1 = plt.subplots(figsize=(8.5, 3.4))
     ax1.plot(runs_df["sweep_percent"], runs_df["min_voltage"], marker="o", label="Min Voltage")
@@ -1858,9 +2007,8 @@ def _render_sensitivity_png(search_result: Dict[str, Any]) -> Optional[bytes]:
 
 
 def _build_rich_docx_bytes(search_result: Dict[str, Any]) -> bytes:
-    from docx import Document
-    from docx.shared import Inches
-
+    if not HAS_DOCX:
+        raise ImportError("python-docx 패키지가 설치되어 있지 않아 Word 보고서를 생성할 수 없습니다.")
     document = Document()
     _add_page_number_footer(document)
     document.add_heading("OLTC-ESS Coordinated Control Report", level=0)
@@ -1929,6 +2077,9 @@ def _build_rich_docx_bytes(search_result: Dict[str, Any]) -> bytes:
         ess_png = _render_ess_power_timeseries_png(run_detail.get('results', {}).get('df_ess_p', pd.DataFrame()), search_result, f"ESS Charge / Discharge: {_run_detail_title_en(run_detail)}")
         if ess_png is not None:
             document.add_picture(io.BytesIO(ess_png), width=Inches(6.6))
+        soc_png = _render_ess_soc_timeseries_png(run_detail.get('results', {}).get('df_soc', pd.DataFrame()), search_result, f"ESS SOC: {_run_detail_title_en(run_detail)}")
+        if soc_png is not None:
+            document.add_picture(io.BytesIO(soc_png), width=Inches(6.6))
 
     document.add_heading("7. Combined Overlay Graphs", level=1)
     overlay_voltage_png = _render_overlay_voltage_png(run_details, search_result)
@@ -1943,6 +2094,9 @@ def _build_rich_docx_bytes(search_result: Dict[str, Any]) -> bytes:
     overlay_ess_png = _render_overlay_ess_png(run_details, search_result)
     if overlay_ess_png is not None:
         document.add_picture(io.BytesIO(overlay_ess_png), width=Inches(6.8))
+    overlay_soc_png = _render_overlay_soc_png(run_details, search_result)
+    if overlay_soc_png is not None:
+        document.add_picture(io.BytesIO(overlay_soc_png), width=Inches(6.8))
 
     document.add_heading("8. Operating Range Summary", level=1)
     runs_df = pd.DataFrame(search_result.get("runs", []))
@@ -2081,18 +2235,46 @@ def _apply_time_axis(ax, labels: list[str]):
     ax.set_xticklabels([labels[idx] for idx in tick_idx], rotation=45, ha="right")
 
 
-def _render_voltage_line_timeseries_png(df_min: pd.DataFrame, df_max: pd.DataFrame, df_line: pd.DataFrame, search_result: Dict[str, Any], title: str) -> Optional[bytes]:
-    if df_min.empty or df_max.empty or df_line.empty:
+def _select_voltage_plot_series(
+    df_v: pd.DataFrame,
+    df_min: pd.DataFrame,
+    df_max: pd.DataFrame,
+) -> tuple[list[str], pd.Series, pd.Series, str, str]:
+    if isinstance(df_v, pd.DataFrame) and not df_v.empty:
+        numeric_df = df_v.apply(pd.to_numeric, errors="coerce")
+        if not numeric_df.empty:
+            low_candidates = numeric_df.min(axis=0).sort_values()
+            high_candidates = numeric_df.max(axis=0).sort_values(ascending=False)
+            low_bus = str(low_candidates.index[0])
+            high_bus = str(high_candidates.index[0])
+            if high_bus == low_bus and len(high_candidates) > 1:
+                high_bus = str(high_candidates.index[1])
+            labels = [str(idx) for idx in numeric_df.index]
+            return labels, numeric_df[low_bus], numeric_df[high_bus], f"{low_bus} Voltage", f"{high_bus} Voltage"
+
+    if isinstance(df_min, pd.DataFrame) and not df_min.empty and isinstance(df_max, pd.DataFrame) and not df_max.empty:
+        labels = [str(idx) for idx in df_min.index]
+        low_series = pd.to_numeric(df_min.iloc[:, 0], errors="coerce")
+        high_series = pd.to_numeric(df_max.iloc[:, 0], errors="coerce")
+        return labels, low_series, high_series, "Min Voltage", "Max Voltage"
+
+    return [], pd.Series(dtype=float), pd.Series(dtype=float), "", ""
+
+
+def _render_voltage_line_timeseries_png(df_v: pd.DataFrame, df_min: pd.DataFrame, df_max: pd.DataFrame, df_line: pd.DataFrame, search_result: Dict[str, Any], title: str) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
+    if df_line.empty:
         return None
 
-    import matplotlib.pyplot as plt
-
-    labels = [str(idx) for idx in df_min.index]
+    labels, low_series, high_series, low_label, high_label = _select_voltage_plot_series(df_v, df_min, df_max)
+    if not labels or low_series.empty or high_series.empty:
+        return None
     x = list(range(len(labels)))
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 5.0), sharex=True)
-    ax1.plot(x, df_min.iloc[:, 0], label="Min Voltage", color="tab:blue")
-    ax1.plot(x, df_max.iloc[:, 0], label="Max Voltage", color="tab:orange")
+    ax1.plot(x, low_series, label=low_label, color="tab:blue")
+    ax1.plot(x, high_series, label=high_label, color="tab:orange")
     ax1.axhline(float(search_result.get("limits", {}).get("voltage_min", 0.94)), linestyle="--", color="red", linewidth=1)
     ax1.axhline(float(search_result.get("limits", {}).get("voltage_max", 1.06)), linestyle="--", color="red", linewidth=1)
     ax1.set_ylabel("Voltage (p.u.)")
@@ -2116,10 +2298,11 @@ def _render_voltage_line_timeseries_png(df_min: pd.DataFrame, df_max: pd.DataFra
 
 
 def _render_representative_timeseries_png(results: Dict[str, pd.DataFrame], search_result: Dict[str, Any]) -> Optional[bytes]:
+    df_v = results.get("df_v", pd.DataFrame()) if results else pd.DataFrame()
     df_min = results.get("df_min_v", pd.DataFrame()) if results else pd.DataFrame()
     df_max = results.get("df_max_v", pd.DataFrame()) if results else pd.DataFrame()
     df_line = results.get("df_line_mva_max", pd.DataFrame()) if results else pd.DataFrame()
-    return _render_voltage_line_timeseries_png(df_min, df_max, df_line, search_result, "Representative Run: Voltage and Line Loading by Time")
+    return _render_voltage_line_timeseries_png(df_v, df_min, df_max, df_line, search_result, "Representative Run: Voltage and Line Loading by Time")
 
 
 def _run_detail_title_en(run_detail: Dict[str, Any]) -> str:
@@ -2129,38 +2312,40 @@ def _run_detail_title_en(run_detail: Dict[str, Any]) -> str:
     )
 
 
-def _active_ess_series(df_ess_p: pd.DataFrame, search_result: Dict[str, Any]) -> tuple[Optional[str], pd.Series]:
-    if df_ess_p.empty:
+def _active_ess_series(df: pd.DataFrame, search_result: Dict[str, Any]) -> tuple[Optional[str], pd.Series]:
+    if df.empty:
         return None, pd.Series(dtype=float)
     config = search_result.get("config", {})
     preferred = f"Bus {int(config.get('ess_bus_number', 5))}"
-    if preferred in df_ess_p.columns:
-        return preferred, pd.to_numeric(df_ess_p[preferred], errors="coerce")
+    if preferred in df.columns:
+        return preferred, pd.to_numeric(df[preferred], errors="coerce")
     best_col = None
     best_mag = -1.0
-    for col in df_ess_p.columns:
-        series = pd.to_numeric(df_ess_p[col], errors="coerce")
+    for col in df.columns:
+        series = pd.to_numeric(df[col], errors="coerce")
         mag = float(series.abs().max(skipna=True)) if not series.empty else 0.0
         if mag > best_mag:
             best_mag = mag
             best_col = col
     if best_col is None:
         return None, pd.Series(dtype=float)
-    return best_col, pd.to_numeric(df_ess_p[best_col], errors="coerce")
+    return best_col, pd.to_numeric(df[best_col], errors="coerce")
 
 
 def _render_run_detail_png(run_detail: Dict[str, Any], search_result: Dict[str, Any]) -> Optional[bytes]:
     detail_results = run_detail.get("results", {}) if run_detail else {}
+    df_v = detail_results.get("df_v", pd.DataFrame())
     df_min = detail_results.get("df_min_v", pd.DataFrame())
     df_max = detail_results.get("df_max_v", pd.DataFrame())
     df_line = detail_results.get("df_line_mva_max", pd.DataFrame())
-    return _render_voltage_line_timeseries_png(df_min, df_max, df_line, search_result, f"Voltage and Line Loading: {_run_detail_title_en(run_detail)}")
+    return _render_voltage_line_timeseries_png(df_v, df_min, df_max, df_line, search_result, f"Voltage and Line Loading: {_run_detail_title_en(run_detail)}")
 
 
 def _render_oltc_timeseries_png(df_tap: pd.DataFrame, title: str) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     if df_tap.empty or "OLTC Tap" not in df_tap.columns:
         return None
-    import matplotlib.pyplot as plt
 
     labels = [str(idx) for idx in df_tap.index]
     x = list(range(len(labels)))
@@ -2181,10 +2366,11 @@ def _render_oltc_timeseries_png(df_tap: pd.DataFrame, title: str) -> Optional[by
 
 
 def _render_ess_power_timeseries_png(df_ess_p: pd.DataFrame, search_result: Dict[str, Any], title: str) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     col, series = _active_ess_series(df_ess_p, search_result)
     if col is None or series.empty:
         return None
-    import matplotlib.pyplot as plt
 
     labels = [str(idx) for idx in df_ess_p.index]
     x = list(range(len(labels)))
@@ -2205,24 +2391,55 @@ def _render_ess_power_timeseries_png(df_ess_p: pd.DataFrame, search_result: Dict
     return buf.getvalue()
 
 
+def _render_ess_soc_timeseries_png(df_soc: pd.DataFrame, search_result: Dict[str, Any], title: str) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
+    col, series = _active_ess_series(df_soc, search_result)
+    if col is None or series.empty or series.dropna().empty:
+        return None
+
+    config = search_result.get("config", {})
+    labels = [str(idx) for idx in df_soc.index]
+    x = list(range(len(labels)))
+    fig, ax = plt.subplots(figsize=(8.5, 2.8))
+    ax.plot(x, series, label=f"ESS SOC ({col})", color="tab:olive")
+    ax.axhline(float(config.get("ess_min_soc", 10.0)), color="tab:red", linewidth=1.0, linestyle="--")
+    ax.axhline(float(config.get("ess_max_soc", 90.0)), color="tab:red", linewidth=1.0, linestyle="--")
+    ax.set_title(title)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("SOC (%)")
+    ax.set_ylim(0.0, 100.0)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    _apply_time_axis(ax, labels)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def _render_overlay_voltage_png(run_details: list[Dict[str, Any]], search_result: Dict[str, Any]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     if not run_details:
         return None
-    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8.8, 4.2))
     labels = []
     for run_detail in run_details:
         detail_results = run_detail.get("results", {})
+        df_v = detail_results.get("df_v", pd.DataFrame())
         df_min = detail_results.get("df_min_v", pd.DataFrame())
         df_max = detail_results.get("df_max_v", pd.DataFrame())
-        if df_min.empty or df_max.empty:
+        labels, low_series, high_series, low_label, high_label = _select_voltage_plot_series(df_v, df_min, df_max)
+        if not labels or low_series.empty or high_series.empty:
             continue
-        labels = [str(idx) for idx in df_min.index]
         x = list(range(len(labels)))
         base = f"{float(run_detail.get('sweep_percent', np.nan)):.1f}%"
-        ax.plot(x, df_min.iloc[:, 0], label=f"{base} Min")
-        ax.plot(x, df_max.iloc[:, 0], linestyle="--", linewidth=1.0, label=f"{base} Max")
+        ax.plot(x, low_series, label=f"{base} {low_label}")
+        ax.plot(x, high_series, linestyle="--", linewidth=1.0, label=f"{base} {high_label}")
     if not labels:
         plt.close(fig)
         return None
@@ -2243,9 +2460,10 @@ def _render_overlay_voltage_png(run_details: list[Dict[str, Any]], search_result
 
 
 def _render_overlay_line_png(run_details: list[Dict[str, Any]], search_result: Dict[str, Any]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     if not run_details:
         return None
-    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8.8, 4.0))
     labels = []
@@ -2276,9 +2494,10 @@ def _render_overlay_line_png(run_details: list[Dict[str, Any]], search_result: D
 
 
 def _render_overlay_oltc_png(run_details: list[Dict[str, Any]]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     if not run_details:
         return None
-    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8.8, 4.0))
     labels = []
@@ -2308,9 +2527,10 @@ def _render_overlay_oltc_png(run_details: list[Dict[str, Any]]) -> Optional[byte
 
 
 def _render_overlay_ess_png(run_details: list[Dict[str, Any]], search_result: Dict[str, Any]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
     if not run_details:
         return None
-    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8.8, 4.0))
     labels = []
@@ -2330,6 +2550,43 @@ def _render_overlay_ess_png(run_details: list[Dict[str, Any]], search_result: Di
     ax.set_title("Combined ESS Charge / Discharge by Run")
     ax.set_xlabel("Time")
     ax.set_ylabel("Active Power (MW)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+    _apply_time_axis(ax, labels)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _render_overlay_soc_png(run_details: list[Dict[str, Any]], search_result: Dict[str, Any]) -> Optional[bytes]:
+    if not HAS_MATPLOTLIB:
+        return None
+    if not run_details:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8.8, 4.0))
+    labels = []
+    for run_detail in run_details:
+        df_soc = run_detail.get("results", {}).get("df_soc", pd.DataFrame())
+        col, series = _active_ess_series(df_soc, search_result)
+        if col is None or series.empty or series.dropna().empty:
+            continue
+        labels = [str(idx) for idx in df_soc.index]
+        x = list(range(len(labels)))
+        base = f"{float(run_detail.get('sweep_percent', np.nan)):.1f}%"
+        ax.plot(x, series, label=base)
+    if not labels:
+        plt.close(fig)
+        return None
+    ax.axhline(float(search_result.get("config", {}).get("ess_min_soc", 10.0)), color="tab:red", linewidth=1.0, linestyle="--")
+    ax.axhline(float(search_result.get("config", {}).get("ess_max_soc", 90.0)), color="tab:red", linewidth=1.0, linestyle="--")
+    ax.set_title("Combined ESS SOC by Run")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("SOC (%)")
+    ax.set_ylim(0.0, 100.0)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
     _apply_time_axis(ax, labels)
@@ -2364,10 +2621,8 @@ def _docx_image_paragraph_xml(rel_id: str, drawing_id: int, name: str, cx: int, 
 
 
 def _add_page_number_footer(document) -> None:
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
+    if not HAS_DOCX:
+        return
     section = document.sections[0]
     footer = section.footer
     paragraph = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
@@ -2470,14 +2725,16 @@ def _build_graph_fallback_docx_bytes(search_result: Dict[str, Any]) -> bytes:
         for line in _run_evaluation_lines(run_detail, search_result):
             add_paragraph(line)
         add_image_section(f"Voltage and Line Loading: {_run_detail_title_en(run_detail)}", _render_run_detail_png(run_detail, search_result), 6.8, 4.0)
-        add_image_section(f"OLTC Tap Position: {_run_detail_title_en(run_detail)}", _render_oltc_timeseries_png(run_detail.get('results', {}).get('df_tap', pd.DataFrame()), f"OLTC Tap Position: {_run_detail_title_en(run_detail)}"), 6.8, 2.8)
-        add_image_section(f"ESS Charge / Discharge: {_run_detail_title_en(run_detail)}", _render_ess_power_timeseries_png(run_detail.get('results', {}).get('df_ess_p', pd.DataFrame()), search_result, f"ESS Charge / Discharge: {_run_detail_title_en(run_detail)}"), 6.8, 2.8)
+        add_image_section(f"OLTC Tap Position: {_run_detail_title_en(run_detail)}", _render_oltc_timeseries_png(run_detail.get('results', {}).get('df_tap', pd.DataFrame()), f"OLTC Tap Position: {_run_detail_title_en(run_detail)}"), 6.8, 2.25)
+        add_image_section(f"ESS Charge / Discharge: {_run_detail_title_en(run_detail)}", _render_ess_power_timeseries_png(run_detail.get('results', {}).get('df_ess_p', pd.DataFrame()), search_result, f"ESS Charge / Discharge: {_run_detail_title_en(run_detail)}"), 6.8, 2.25)
+        add_image_section(f"ESS SOC: {_run_detail_title_en(run_detail)}", _render_ess_soc_timeseries_png(run_detail.get('results', {}).get('df_soc', pd.DataFrame()), search_result, f"ESS SOC: {_run_detail_title_en(run_detail)}"), 6.8, 2.25)
 
     add_paragraph("8. Combined Overlay Graphs", bold=True)
     add_image_section("Combined Voltage Profiles by Run", _render_overlay_voltage_png(run_details, search_result), 6.8, 4.0)
     add_image_section("Combined Line Loading by Run", _render_overlay_line_png(run_details, search_result), 6.8, 4.0)
     add_image_section("Combined OLTC Tap Position by Run", _render_overlay_oltc_png(run_details), 6.8, 4.0)
     add_image_section("Combined ESS Charge / Discharge by Run", _render_overlay_ess_png(run_details, search_result), 6.8, 4.0)
+    add_image_section("Combined ESS SOC by Run", _render_overlay_soc_png(run_details, search_result), 6.8, 4.0)
 
     add_paragraph("9. Operating Range Summary", bold=True)
     for line in _run_range_report_lines(search_result):
@@ -2537,16 +2794,16 @@ def _build_graph_fallback_docx_bytes(search_result: Dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 def build_word_report_bytes(search_result: Dict[str, Any]) -> bytes:
-    # 1) python-docx rich report 2) 수동 OOXML 그래프 리포트 3) 텍스트형 최소 리포트 순으로 시도한다.
+    # 샘플 DOCX와 가장 유사한 그래프 포함 보고서를 우선 시도하고, 필요 시 rich/text 리포트로 폴백한다.
     try:
-        return _build_rich_docx_bytes(search_result)
-    except Exception as rich_exc:
+        return _build_graph_fallback_docx_bytes(search_result)
+    except Exception as graph_exc:
         try:
-            return _build_graph_fallback_docx_bytes(search_result)
-        except Exception as graph_exc:
+            return _build_rich_docx_bytes(search_result)
+        except Exception as rich_exc:
             lines = [
-                f"그래프 포함 보고서 생성 실패: {type(rich_exc).__name__} -> {type(graph_exc).__name__}",
-                "환경에 python-docx 또는 matplotlib가 누락되었을 가능성이 있습니다.",
+                f"보고서 생성 실패: {type(graph_exc).__name__} -> {type(rich_exc).__name__}",
+                "환경에 matplotlib 또는 python-docx가 누락되었을 가능성이 있습니다.",
                 "",
             ] + _report_lines(search_result)
             return _build_docx_bytes("OLTC-ESS 협조제어 분석 보고서", lines)

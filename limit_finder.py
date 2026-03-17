@@ -104,7 +104,7 @@ def main():
             "base_ess_power_mw": float(config["ess_power_mw"]),
             "base_ess_capacity_mwh": float(config["ess_capacity_mwh"]),
         }
-        scenarios = generate_scenarios(args.batch_scenario_mode, settings)
+        scenarios = generate_scenarios(args.batch_scenario_mode, settings, bus_count=len(bus_df))
         print(f"[BATCH] mode={scenario_mode_label(args.batch_scenario_mode)} | Generated {len(scenarios)} scenarios")
 
         batch_result = run_batch_simulations(

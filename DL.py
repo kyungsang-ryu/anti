@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import subprocess
@@ -18,7 +19,9 @@ from coordinated_engine import (
     SCENARIO_MODE_LOAD_PV_MAP,
     SCENARIO_RENEWABLE_BY_LOAD_LEVEL,
     SCENARIO_RENEWABLE_INCREASE,
+    build_all_scenarios_excel_bytes,
     build_analysis_excel_bytes,
+    build_batch_detailed_excel_bytes,
     build_batch_summary_csv_bytes,
     build_batch_summary_excel_bytes,
     build_scenario_preview_df,
@@ -39,6 +42,8 @@ from sim_engine import (
     LOAD_Q_COL,
     PV_P_COL,
     WIND_P_COL,
+    ESS_MAX_COL,
+    ESS_CAP_COL,
     default_bus_dataframe,
     default_config,
     default_time_profile_dataframe,
@@ -53,8 +58,14 @@ SCENARIO_OPTIONS = [
     SCENARIO_BOTH_INCREASE,
     SCENARIO_RENEWABLE_BY_LOAD_LEVEL,
 ]
-BUS_OPTIONS = [f"Bus {i}" for i in range(1, 6)]
-BUS_INDEX_MAP = {name: idx + 1 for idx, name in enumerate(BUS_OPTIONS)}
+CONFIG_FILE = "config.json"
+
+def get_bus_options() -> list[str]:
+    count = len(st.session_state.get("bus_df", [])) if "bus_df" in st.session_state else 5
+    return [f"Bus {i}" for i in range(1, count + 1)]
+
+def get_bus_index_map() -> dict[str, int]:
+    return {name: idx + 1 for idx, name in enumerate(get_bus_options())}
 BATCH_SCENARIO_MODE_OPTIONS = [
     SCENARIO_MODE_HOSTING_CAPACITY,
     SCENARIO_MODE_LOAD_PV_MAP,
@@ -123,10 +134,108 @@ def parse_impedance(z_str: str):
         return 0.0, 0.0
 
 
+def _json_safe_value(value):
+    if value is None:
+        return None
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _serialize_dataframe(df: pd.DataFrame) -> list[dict]:
+    if not isinstance(df, pd.DataFrame):
+        return []
+    rows = []
+    for _, row in df.iterrows():
+        rows.append({col: _json_safe_value(row[col]) for col in df.columns})
+    return rows
+
+
+def _restore_bus_dataframe(saved_rows):
+    if not isinstance(saved_rows, list) or not saved_rows:
+        return None
+    try:
+        restored = pd.DataFrame(saved_rows)
+        row_count = max(1, len(restored))
+        bus_df = default_bus_dataframe(bus_count=row_count)
+        for col in bus_df.columns:
+            if col in restored.columns:
+                bus_df[col] = restored[col].iloc[:row_count].tolist()
+        bus_df[BUS_COL] = [f"Bus {i}" for i in range(1, row_count + 1)]
+        return bus_df
+    except Exception:
+        return None
+
+
+def _restore_time_profile_dataframe(saved_rows):
+    if not isinstance(saved_rows, list) or not saved_rows:
+        return None
+    try:
+        restored = pd.DataFrame(saved_rows)
+        template = default_time_profile_dataframe()
+        if restored.empty:
+            return template
+        for col in template.columns:
+            if col not in restored.columns:
+                default_values = template[col].tolist()
+                restored[col] = [default_values[min(i, len(default_values) - 1)] for i in range(len(restored))]
+        return restored[template.columns].copy()
+    except Exception:
+        return None
+
+
+def normalize_bus_selection_state():
+    bus_df = st.session_state.get("bus_df")
+    requested_bus_count = max(1, int(st.session_state.get("cfg_bus_count", 5)))
+    if isinstance(bus_df, pd.DataFrame) and not bus_df.empty:
+        bus_count = len(bus_df)
+    else:
+        bus_count = requested_bus_count
+        st.session_state["bus_df"] = default_bus_dataframe(bus_count=bus_count)
+
+    st.session_state.setdefault("cfg_bus_count", bus_count)
+    try:
+        ess_bus_number = int(st.session_state.get("cfg_ess_bus_number", min(5, bus_count)))
+    except Exception:
+        ess_bus_number = min(5, bus_count)
+    label = st.session_state.get("cfg_ess_bus_label")
+    if isinstance(label, str) and label.startswith("Bus "):
+        try:
+            ess_bus_number = int(label.split("Bus ", 1)[1])
+        except Exception:
+            pass
+    ess_bus_number = max(1, min(ess_bus_number, bus_count))
+    st.session_state["cfg_ess_bus_number"] = ess_bus_number
+    valid_labels = {f"Bus {i}" for i in range(1, bus_count + 1)}
+    if st.session_state.get("cfg_ess_bus_label") not in valid_labels:
+        st.session_state["cfg_ess_bus_label"] = f"Bus {ess_bus_number}"
+
+
+def _build_persisted_state():
+    payload = {}
+    for key, value in st.session_state.items():
+        if key.startswith("cfg_") and isinstance(value, (int, float, str, bool)):
+            payload[key] = _json_safe_value(value)
+    payload["bus_df"] = _serialize_dataframe(st.session_state.get("bus_df", default_bus_dataframe()))
+    payload["time_df"] = _serialize_dataframe(st.session_state.get("time_df", default_time_profile_dataframe()))
+    return payload
+
+
 def init_session_state():
     defaults = default_config()
     st.session_state.setdefault("bus_df", default_bus_dataframe())
     st.session_state.setdefault("time_df", default_time_profile_dataframe())
+    st.session_state.setdefault("cfg_bus_count", 5)
     st.session_state.setdefault("sim_results", None)
     st.session_state.setdefault("sim_events", None)
     st.session_state.setdefault("sim_result_context", None)
@@ -140,10 +249,30 @@ def init_session_state():
     st.session_state.setdefault("auto_search_result", None)
     st.session_state.setdefault("auto_report_bytes", None)
     st.session_state.setdefault("auto_report_name", "simulation_report.docx")
+    st.session_state.setdefault("auto_excel_bytes", None)
     st.session_state.setdefault("batch_result", None)
     st.session_state.setdefault("batch_summary_csv_bytes", None)
     st.session_state.setdefault("batch_summary_excel_bytes", None)
+    st.session_state.setdefault("batch_detailed_excel_bytes", None)
     st.session_state.setdefault("batch_summary_prefix", "batch_summary")
+
+    if os.path.exists(CONFIG_FILE) and "config_loaded" not in st.session_state:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            for k, v in saved.items():
+                if k.startswith("cfg_"):
+                    st.session_state[k] = v
+            restored_bus_df = _restore_bus_dataframe(saved.get("bus_df"))
+            if restored_bus_df is not None:
+                st.session_state["bus_df"] = restored_bus_df
+                st.session_state["cfg_bus_count"] = len(restored_bus_df)
+            restored_time_df = _restore_time_profile_dataframe(saved.get("time_df"))
+            if restored_time_df is not None:
+                st.session_state["time_df"] = restored_time_df
+            st.session_state["config_loaded"] = True
+        except Exception:
+            pass
 
     for key, value in defaults.items():
         st.session_state.setdefault(f"cfg_{key}", value)
@@ -152,10 +281,10 @@ def init_session_state():
     st.session_state.setdefault("cfg_auto_start_scale", 1.0)
     st.session_state.setdefault("cfg_auto_step", 0.1)
     st.session_state.setdefault("cfg_auto_max_scale", 3.0)
-    st.session_state.setdefault("cfg_voltage_min_limit", 0.94)
-    st.session_state.setdefault("cfg_voltage_max_limit", 1.06)
-    st.session_state.setdefault("cfg_voltage_low_off", 0.955)
-    st.session_state.setdefault("cfg_voltage_high_off", 1.045)
+    st.session_state.setdefault("cfg_voltage_min_limit", 0.908)
+    st.session_state.setdefault("cfg_voltage_max_limit", 1.039)
+    st.session_state.setdefault("cfg_voltage_low_off", 0.920)
+    st.session_state.setdefault("cfg_voltage_high_off", 1.020)
     st.session_state.setdefault("cfg_line_limit_mva", 12.0)
     st.session_state.setdefault("cfg_line_return_ratio", 0.95)
     st.session_state.setdefault("cfg_oltc_return_delay_mins", 20)
@@ -185,6 +314,7 @@ def init_session_state():
     st.session_state.setdefault("cfg_batch_parallel", True)
     st.session_state.setdefault("cfg_batch_include_timeseries", False)
     st.session_state.setdefault("cfg_batch_max_workers", min(4, max(1, int(os.cpu_count() or 1))))
+    normalize_bus_selection_state()
 
 
 def apply_pending_config_updates():
@@ -223,9 +353,11 @@ def reset_run_state(clear_results: bool = True):
         st.session_state["excel_bytes"] = None
         st.session_state["auto_search_result"] = None
         st.session_state["auto_report_bytes"] = None
+        st.session_state["auto_excel_bytes"] = None
         st.session_state["batch_result"] = None
         st.session_state["batch_summary_csv_bytes"] = None
         st.session_state["batch_summary_excel_bytes"] = None
+        st.session_state["batch_detailed_excel_bytes"] = None
 
 
 
@@ -381,7 +513,7 @@ def render_batch_mode_panel(locked: bool) -> bool:
         scenarios = []
         try:
             batch_settings = build_batch_settings_from_state()
-            scenarios = generate_scenarios(mode, batch_settings)
+            scenarios = generate_scenarios(mode, batch_settings, bus_count=len(st.session_state.get("bus_df", [])))
             preview_df = build_scenario_preview_df(scenarios)
             st.caption(f"Scenario count: {len(scenarios)}")
             if not preview_df.empty:
@@ -425,12 +557,7 @@ def render_run_controls():
 
 def get_config_from_state(cncv_r: float, cncv_x: float, acsr_r: float, acsr_x: float):
     # 위젯 상태를 실제 시뮬레이션 설정 딕셔너리로 묶는다.
-    return {
-        "len_01": float(st.session_state["cfg_len_01"]),
-        "len_12": float(st.session_state["cfg_len_12"]),
-        "len_23": float(st.session_state["cfg_len_23"]),
-        "len_34": float(st.session_state["cfg_len_34"]),
-        "len_45": float(st.session_state["cfg_len_45"]),
+    config_dict = {
         "cncv_r": float(cncv_r),
         "cncv_x": float(cncv_x),
         "acsr_r": float(acsr_r),
@@ -459,22 +586,131 @@ def get_config_from_state(cncv_r: float, cncv_x: float, acsr_r: float, acsr_x: f
         "ess_power_mw": float(st.session_state["cfg_ess_power_mw"]),
         "ess_capacity_mwh": float(st.session_state["cfg_ess_capacity_mwh"]),
     }
+    
+    # 동적 선로 길이 추가
+    bus_count = int(st.session_state.get("cfg_bus_count", 5))
+    for i in range(bus_count):
+        key = f"cfg_len_{i}{i+1}"
+        config_dict[f"len_{i}{i+1}"] = float(st.session_state.get(key, 1.0 if i == 0 else 0.5))
+        
+    return config_dict
+
+
+def save_user_config():
+    config_file = "config.json"
+    to_save = {}
+    for k, v in st.session_state.items():
+        if k.startswith("cfg_") and isinstance(v, (int, float, str, bool)):
+            to_save[k] = v
+    try:
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, indent=4, ensure_ascii=False)
+        st.sidebar.success("설정이 저장되었습니다. (F5 새로고침 시 유지)")
+    except Exception as e:
+        st.sidebar.error(f"설정 저장 실패: {e}")
+
+
+def save_user_config(show_status: bool = True):
+    to_save = _build_persisted_state()
+    snapshot = json.dumps(to_save, ensure_ascii=False, sort_keys=True)
+    if snapshot == st.session_state.get("config_snapshot"):
+        return True
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, indent=4, ensure_ascii=False)
+        st.session_state["config_snapshot"] = snapshot
+        st.session_state["config_loaded"] = True
+        if show_status:
+            st.sidebar.success("?ㅼ젙????λ릺?덉뒿?덈떎. (F5 ?덈줈怨좎묠 ???좎?)")
+        return True
+    except Exception as e:
+        if show_status:
+            st.sidebar.error(f"?ㅼ젙 ????ㅽ뙣: {e}")
+        return False
+
+
+def autosave_user_config_if_needed():
+    save_user_config(show_status=False)
 
 
 def build_sidebar_config():
+    sync_bus_editor_to_session()
+    normalize_bus_selection_state()
     locked = st.session_state.get("is_running", False)
     if locked:
         st.sidebar.warning("시뮬레이션 실행 중에는 설정 변경이 잠금됩니다.")
 
     st.sidebar.header("분석 시나리오")
-    st.sidebar.selectbox("자동 분석 유형", options=SCENARIO_OPTIONS, format_func=scenario_label, key="cfg_scenario", disabled=locked)
+    st.sidebar.selectbox("다중 시나리오 분석 유형", options=SCENARIO_OPTIONS, format_func=scenario_label, key="cfg_scenario", disabled=locked)
 
-    with st.sidebar.expander("선로 길이 설정 (km)", expanded=False):
-        st.number_input("Line 0-1 (CNCV)", step=0.5, key="cfg_len_01", disabled=locked)
-        st.number_input("Line 1-2 (ACSR)", step=0.5, key="cfg_len_12", disabled=locked)
-        st.number_input("Line 2-3 (ACSR)", step=0.5, key="cfg_len_23", disabled=locked)
-        st.number_input("Line 3-4 (ACSR)", step=0.5, key="cfg_len_34", disabled=locked)
-        st.number_input("Line 4-5 (ACSR)", step=0.5, key="cfg_len_45", disabled=locked)
+    scenario_descriptions = {
+        SCENARIO_LOAD_INCREASE: (
+            "✅ 부하만 증가 시나리오\n\n"
+            "- 재생에너지 발전량은 기본값(100%) 유지\n"
+            "- 부하량을 지정된 '증가 시작 배율'부터 '최대 증가 배율'까지 '간격' 단위로 증가시키며 시뮬레이션\n"
+            "- 전압 강하 및 선로 과부하가 발생하는 한계 부하량을 탐색\n"
+        ),
+        SCENARIO_RENEWABLE_INCREASE: (
+            "✅ 재생에너지 출력 증가 시나리오\n\n"
+            "- 부하량은 기본값(100%) 유지\n"
+            "- 재생에너지 발전량(PV 등)을 지정된 배율 범위로 증가시키며 시뮬레이션\n"
+            "- 과전압 및 역조류에 의한 선로 과부하 한계 수용력을 탐색\n"
+        ),
+        SCENARIO_BOTH_INCREASE: (
+            "✅ 부하와 재생에너지 동시 증가 시나리오\n\n"
+            "- 부하량과 재생에너지 발전량을 동일한 배율로 동시에 증가시키며 시뮬레이션\n"
+            "- 복합적인 계통 스트레스 상태(혼잡 및 전압 변동)를 평가\n"
+        ),
+        SCENARIO_RENEWABLE_BY_LOAD_LEVEL: (
+            "✅ 부하구간별 재생에너지 수용력 평가 시나리오\n\n"
+            "- 24시간 프로파일을 경부하, 중간부하, 중부하 구간으로 분류\n"
+            "- 각 부하 구간별로 재생에너지 발전량을 지정된 배율로 증가시키며 시뮬레이션\n"
+            "- 각 부하 수준에 따른 독립적인 재생에너지 수용력 한계를 도출\n"
+        )
+    }
+
+    current_scenario = st.session_state.get("cfg_scenario", SCENARIO_LOAD_INCREASE)
+    scenario_desc_text = scenario_descriptions.get(current_scenario, "설명이 없습니다.")
+    
+    st.sidebar.info(scenario_desc_text)
+    
+    try:
+        with open("simulator_whitepaper.md", "r", encoding="utf-8") as f:
+            whitepaper_md = f.read()
+    except Exception:
+        whitepaper_md = "백서 파일(simulator_whitepaper.md)을 찾을 수 없습니다."
+
+    st.sidebar.download_button(
+        label="시뮬레이터 백서 다운로드 (.md)",
+        data=whitepaper_md.encode('utf-8'),
+        file_name="simulator_whitepaper.md",
+        mime="text/markdown",
+        key="download_whitepaper"
+    )
+
+    bus_count = int(st.session_state.get("cfg_bus_count", 5))
+    with st.sidebar.expander("동적 모선 규모 / 선로 길이 설정 (km)", expanded=False):
+        st.caption("모선(Bus) 개수를 늘리거나 줄일 수 있습니다.")
+        new_bus_count = st.number_input("모선 개수", min_value=1, max_value=20, step=1, key="cfg_bus_count", disabled=locked)
+        
+        # bus_df 크기가 number_input과 다르면 동적으로 조정 (데이터 유지)
+        if st.session_state.get("bus_df") is not None and len(st.session_state["bus_df"]) != new_bus_count:
+            with st.spinner("모선 수 조정 중..."):
+                old_df = st.session_state["bus_df"].copy()
+                new_df = resize_bus_dataframe_preserve_values(old_df, int(new_bus_count))
+                st.session_state["bus_df"] = new_df
+                # ESS 위치가 범위를 벗어나면 마지막 버스로 조정
+                if int(st.session_state.get("cfg_ess_bus_number", 1)) > new_bus_count:
+                    st.session_state["cfg_ess_bus_number"] = new_bus_count
+                    st.session_state["cfg_ess_bus_label"] = f"Bus {int(new_bus_count)}"
+                st.rerun()
+
+        st.caption(f"Line 0-{new_bus_count} 길이 설정")
+        for i in range(new_bus_count):
+            label = f"Line {i}-{i+1} ({'CNCV' if i == 0 else 'ACSR'})"
+            key = f"cfg_len_{i}{i+1}"
+            st.session_state.setdefault(key, 1.0 if i == 0 else 0.5)
+            st.number_input(label, step=0.1, key=key, disabled=locked)
 
     with st.sidebar.expander("선로 임피던스 (옴/km)", expanded=False):
         st.caption("형식: R + jX")
@@ -494,7 +730,11 @@ def build_sidebar_config():
         st.slider("OLTC 복귀 지연 (분)", 1, 60, key="cfg_oltc_return_delay_mins", disabled=locked)
 
     with st.sidebar.expander("ESS 설정", expanded=False):
-        st.selectbox("ESS 설치 버스", options=BUS_OPTIONS, index=int(st.session_state["cfg_ess_bus_number"]) - 1, key="cfg_ess_bus_label", disabled=locked)
+        bus_opts = get_bus_options()
+        # Ensure selected index is valid
+        current_idx = int(st.session_state.get("cfg_ess_bus_number", min(5, len(bus_opts)))) - 1
+        current_idx = max(0, min(current_idx, len(bus_opts) - 1))
+        st.selectbox("ESS 설치 버스", options=bus_opts, index=current_idx, key="cfg_ess_bus_label", disabled=locked)
         st.number_input("ESS 정격출력 (MW)", min_value=0.0, step=0.5, key="cfg_ess_power_mw", disabled=locked)
         st.number_input("ESS 에너지용량 (MWh)", min_value=0.0, step=1.0, key="cfg_ess_capacity_mwh", disabled=locked)
         st.slider("ESS 초기 SOC (%)", 0.0, 100.0, step=5.0, key="cfg_ess_init_soc", disabled=locked)
@@ -506,12 +746,29 @@ def build_sidebar_config():
         st.number_input("경부하 상한 (%)", min_value=0.0, max_value=100.0, step=5.0, key="cfg_low_load_upper_pct", disabled=locked)
         st.number_input("중간부하 상한 (%)", min_value=0.0, max_value=100.0, step=5.0, key="cfg_mid_load_upper_pct", disabled=locked)
 
-    with st.sidebar.expander("자동 분석 범위", expanded=False):
+    with st.sidebar.expander("다중 시나리오 분석 범위", expanded=True):
+        st.caption("※ 시뮬레이션 할 증가 범위를 마음대로 조절할 수 있습니다.")
         st.number_input("증가 시작 배율", min_value=0.1, step=0.1, key="cfg_auto_start_scale", disabled=locked)
         st.number_input("증가 배율 간격", min_value=0.01, step=0.01, key="cfg_auto_step", disabled=locked)
         st.number_input("최대 증가 배율", min_value=0.2, step=0.1, key="cfg_auto_max_scale", disabled=locked)
 
-    st.session_state["cfg_ess_bus_number"] = BUS_INDEX_MAP[st.session_state["cfg_ess_bus_label"]]
+    st.sidebar.divider()
+    if st.sidebar.button("현재 설정(사이드바) 기본값으로 저장", disabled=locked, use_container_width=True):
+        save_user_config()
+
+    st.session_state["cfg_ess_bus_number"] = get_bus_index_map()[st.session_state["cfg_ess_bus_label"]]
+
+    if "bus_df" in st.session_state:
+        bdf = st.session_state["bus_df"]
+        if "ESS_최대출력" in bdf.columns and "ESS_용량" in bdf.columns:
+            bdf["ESS_최대출력"] = 0.0
+            bdf["ESS_용량"] = 0.0
+            ess_idx = int(st.session_state["cfg_ess_bus_number"]) - 1
+            if 0 <= ess_idx < len(bdf):
+                bdf.at[ess_idx, "ESS_최대출력"] = float(st.session_state.get("cfg_ess_power_mw", 0.0))
+                bdf.at[ess_idx, "ESS_용량"] = float(st.session_state.get("cfg_ess_capacity_mwh", 0.0))
+            st.session_state["bus_df"] = bdf
+
     return get_config_from_state(cncv_r, cncv_x, acsr_r, acsr_x)
 
 
@@ -519,17 +776,51 @@ def editable_bus_dataframe(bus_df: pd.DataFrame) -> pd.DataFrame:
     return bus_df[[BUS_COL, LOAD_P_COL, LOAD_Q_COL, PV_P_COL, WIND_P_COL]].copy()
 
 
+def on_bus_editor_change():
+    """st.data_editor의 'bus_editor' 키에 데이터가 변경되었을 때 즉시 session_state에 병합한다."""
+    sync_bus_editor_to_session()
+
 def merge_bus_editor(edited_df: pd.DataFrame):
-    # 사용자가 수정하는 버스 데이터는 부하/PV/Wind만 반영하고 ESS는 별도 설정으로 관리한다.
+    """주어진 DataFrame을 원본 st.session_state['bus_df']에 안전하게 병합한다."""
+    if edited_df is None:
+        return
     base = st.session_state["bus_df"].copy()
-    for col in [BUS_COL, LOAD_P_COL, LOAD_Q_COL, PV_P_COL, WIND_P_COL]:
-        base[col] = edited_df[col]
+    # 편집 가능한 컬럼들만 업데이트
+    target_cols = [BUS_COL, LOAD_P_COL, LOAD_Q_COL, PV_P_COL, WIND_P_COL]
+    common_rows = min(len(base), len(edited_df))
+    if common_rows <= 0:
+        return
+    for col in target_cols:
+        if col in edited_df.columns and col in base.columns:
+            base.loc[: common_rows - 1, col] = edited_df.iloc[:common_rows][col].values
+    base[BUS_COL] = [f"Bus {i}" for i in range(1, len(base) + 1)]
     st.session_state["bus_df"] = base
+
+
+def sync_bus_editor_to_session():
+    editor_df = st.session_state.get("bus_editor")
+    if isinstance(editor_df, pd.DataFrame) and "bus_df" in st.session_state:
+        merge_bus_editor(editor_df)
+
+
+def resize_bus_dataframe_preserve_values(old_df: pd.DataFrame, new_bus_count: int) -> pd.DataFrame:
+    new_df = default_bus_dataframe(bus_count=int(new_bus_count))
+    cols_to_keep = [LOAD_P_COL, LOAD_Q_COL, PV_P_COL, WIND_P_COL, ESS_MAX_COL, ESS_CAP_COL]
+    common_rows = min(len(old_df), len(new_df))
+    if common_rows > 0:
+        for col in cols_to_keep:
+            if col in old_df.columns and col in new_df.columns:
+                new_df.loc[: common_rows - 1, col] = old_df.iloc[:common_rows][col].values
+    new_df[BUS_COL] = [f"Bus {i}" for i in range(1, len(new_df) + 1)]
+    return new_df
 
 
 def apply_recommended_base_case():
     # 재생에너지 증가 시 역송전이 과도해지지 않도록 기본 부하를 총 15 MW 수준으로 조정한다.
-    bus_df = st.session_state["bus_df"].copy()
+    new_bus_count = 5
+    st.session_state["cfg_bus_count"] = new_bus_count
+    
+    bus_df = default_bus_dataframe(bus_count=new_bus_count)
     bus_df[LOAD_P_COL] = [2.4, 2.7, 3.0, 3.3, 3.6]
     bus_df[LOAD_Q_COL] = [0.24, 0.27, 0.30, 0.33, 0.36]
     bus_df[PV_P_COL] = [0.0, 0.0, 2.0, 4.0, 8.0]
@@ -539,6 +830,29 @@ def apply_recommended_base_case():
     st.session_state["cfg_ess_bus_label"] = "Bus 5"
     st.session_state["cfg_ess_power_mw"] = 5.0
     st.session_state["cfg_ess_capacity_mwh"] = 15.0
+
+
+def apply_recommended_base_case():
+    # Widget 생성 이후에는 cfg_bus_count를 직접 수정할 수 없으므로 다음 rerun에서 적용한다.
+    new_bus_count = 5
+    bus_df = default_bus_dataframe(bus_count=new_bus_count)
+    bus_df[LOAD_P_COL] = [2.4, 2.7, 3.0, 3.3, 3.6]
+    bus_df[LOAD_Q_COL] = [0.24, 0.27, 0.30, 0.33, 0.36]
+    bus_df[PV_P_COL] = [0.0, 0.0, 2.0, 4.0, 8.0]
+    bus_df[WIND_P_COL] = [0.0, 5.0, 0.0, 0.0, 0.0]
+    st.session_state["pending_cfg_update"] = {
+        "cfg_bus_count": new_bus_count,
+        "bus_df": bus_df,
+        "cfg_ess_bus_number": 5,
+        "cfg_ess_bus_label": "Bus 5",
+        "cfg_ess_power_mw": 5.0,
+        "cfg_ess_capacity_mwh": 15.0,
+        "cfg_len_01": 3.0,
+        "cfg_len_12": 1.0,
+        "cfg_len_23": 1.0,
+        "cfg_len_34": 1.0,
+        "cfg_len_45": 1.0,
+    }
 
 
 def render_topology(display_bus_df: pd.DataFrame):
@@ -554,19 +868,19 @@ def render_topology(display_bus_df: pd.DataFrame):
             comps.append("ESS")
         return "<br>".join(comps) if comps else "빈 모선"
 
+    bus_count = len(display_bus_df)
     diagram_html = f"""
-<div style="display:flex;justify-content:space-between;align-items:center;background:#f2f5f8;padding:18px;border-radius:12px;color:#111;text-align:center;font-size:13px;">
-    <div><b>Substation</b><br>OLTC</div>
-    <div>▶<br><span style="font-size:11px;color:#466;">{st.session_state['cfg_len_01']}km</span></div>
-    <div><b>Bus 1</b><br><span style="font-size:12px;">{get_components(0)}</span></div>
-    <div>▶<br><span style="font-size:11px;color:#466;">{st.session_state['cfg_len_12']}km</span></div>
-    <div><b>Bus 2</b><br><span style="font-size:12px;">{get_components(1)}</span></div>
-    <div>▶<br><span style="font-size:11px;color:#466;">{st.session_state['cfg_len_23']}km</span></div>
-    <div><b>Bus 3</b><br><span style="font-size:12px;">{get_components(2)}</span></div>
-    <div>▶<br><span style="font-size:11px;color:#466;">{st.session_state['cfg_len_34']}km</span></div>
-    <div><b>Bus 4</b><br><span style="font-size:12px;">{get_components(3)}</span></div>
-    <div>▶<br><span style="font-size:11px;color:#466;">{st.session_state['cfg_len_45']}km</span></div>
-    <div><b>Bus 5</b><br><span style="font-size:12px;">{get_components(4)}</span></div>
+<div style="display:flex;justify-content:space-between;align-items:center;background:#f2f5f8;padding:18px;border-radius:12px;color:#111;text-align:center;font-size:13px;flex-wrap:wrap;gap:10px;">
+    <div><b>Substation</b><br>OLTC</div>"""
+
+    for i in range(bus_count):
+        length_key = f"cfg_len_{i}{i+1}"
+        length_val = st.session_state.get(length_key, 1.0 if i == 0 else 0.5)
+        diagram_html += f"""
+    <div>▶<br><span style="font-size:11px;color:#466;">{length_val}km</span></div>
+    <div><b>Bus {i+1}</b><br><span style="font-size:12px;">{get_components(i)}</span></div>"""
+
+    diagram_html += """
 </div>
 """
     st.markdown(diagram_html, unsafe_allow_html=True)
@@ -591,7 +905,7 @@ def load_uploaded_profile(disabled: bool = False):
 def render_algorithm_tab():
     # 알고리즘 탭은 preset 적용과 세부 파라미터 수정을 한 곳에서 수행한다.
     locked = st.session_state.get("is_running", False)
-    st.subheader("협조제어 알고리즘 수정")
+    st.subheader("ESS-OLTC 운영 알고리즘 수정")
     if locked:
         st.warning("시뮬레이션 실행 중에는 알고리즘 파라미터를 변경할 수 없습니다.")
         return
@@ -631,46 +945,29 @@ def render_algorithm_tab():
             """
         )
 
-    with st.form("algo_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            algo_voltage_min = st.number_input("전압 하한 (p.u.)", value=float(st.session_state["cfg_voltage_min_limit"]), step=0.01, key="algo_voltage_min")
-            algo_voltage_low_off = st.number_input("저전압 해제 기준 (p.u.)", value=float(st.session_state["cfg_voltage_low_off"]), step=0.005, key="algo_voltage_low_off")
-            algo_line_limit = st.number_input("선로용량 한도 (MVA)", value=float(st.session_state["cfg_line_limit_mva"]), step=0.5, key="algo_line_limit")
-            algo_line_return_ratio = st.number_input("선로 복귀 비율 (0~1)", value=float(st.session_state["cfg_line_return_ratio"]), min_value=0.50, max_value=1.0, step=0.01, key="algo_line_return_ratio")
-            algo_oltc_delay = st.number_input("OLTC 동작 지연 (분)", value=float(st.session_state["cfg_oltc_delay_mins"]), step=1.0, key="algo_oltc_delay")
-            algo_oltc_return = st.number_input("OLTC 복귀 지연 (분)", value=float(st.session_state["cfg_oltc_return_delay_mins"]), step=1.0, key="algo_oltc_return")
-            algo_ess_p = st.number_input("ESS 유효전력 이득", value=float(st.session_state["cfg_ess_p_gain"]), step=0.5, key="algo_ess_p")
-            algo_ess_min_soc = st.number_input("ESS 최소 SOC lock (%)", value=float(st.session_state["cfg_ess_min_soc"]), step=1.0, key="algo_ess_min_soc")
-        with col2:
-            algo_voltage_max = st.number_input("전압 상한 (p.u.)", value=float(st.session_state["cfg_voltage_max_limit"]), step=0.01, key="algo_voltage_max")
-            algo_voltage_high_off = st.number_input("과전압 해제 기준 (p.u.)", value=float(st.session_state["cfg_voltage_high_off"]), step=0.005, key="algo_voltage_high_off")
-            algo_line_relief = st.number_input("선로 혼잡 완화 이득", value=float(st.session_state["cfg_line_relief_gain"]), step=0.5, key="algo_line_relief")
-            algo_ess_q = st.number_input("ESS 무효전력 이득", value=float(st.session_state["cfg_ess_q_gain"]), step=0.5, key="algo_ess_q")
-            algo_ramp = st.number_input("ESS 램프율 (MW/분)", value=float(st.session_state["cfg_ess_ramp_rate_mw_per_min"]), step=0.05, key="algo_ramp")
-            algo_step = st.number_input("OLTC 탭당 전압 변동률 (%)", value=float(st.session_state["cfg_oltc_step"]), step=0.05, key="algo_step")
-            algo_ess_max_soc = st.number_input("ESS 최대 SOC lock (%)", value=float(st.session_state["cfg_ess_max_soc"]), step=1.0, key="algo_ess_max_soc")
-        submitted = st.form_submit_button("알고리즘 설정 적용", type="primary")
+    def sync_algo_to_cfg(algo_key, cfg_key):
+        st.session_state[cfg_key] = st.session_state[algo_key]
 
-    if submitted:
-        st.session_state["pending_cfg_update"] = {
-            "cfg_voltage_min_limit": float(algo_voltage_min),
-            "cfg_voltage_max_limit": float(algo_voltage_max),
-            "cfg_voltage_low_off": float(algo_voltage_low_off),
-            "cfg_voltage_high_off": float(algo_voltage_high_off),
-            "cfg_line_limit_mva": float(algo_line_limit),
-            "cfg_line_return_ratio": float(algo_line_return_ratio),
-            "cfg_oltc_delay_mins": float(algo_oltc_delay),
-            "cfg_oltc_return_delay_mins": float(algo_oltc_return),
-            "cfg_ess_p_gain": float(algo_ess_p),
-            "cfg_ess_q_gain": float(algo_ess_q),
-            "cfg_line_relief_gain": float(algo_line_relief),
-            "cfg_ess_ramp_rate_mw_per_min": float(algo_ramp),
-            "cfg_oltc_step": float(algo_step),
-            "cfg_ess_min_soc": float(algo_ess_min_soc),
-            "cfg_ess_max_soc": float(algo_ess_max_soc),
-        }
-        st.rerun()
+    st.markdown("**(아래 설정은 좌측 사이드바와 실시간으로 동기화됩니다)**")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.number_input("전압 하한 (p.u.)", value=float(st.session_state["cfg_voltage_min_limit"]), step=0.01, key="algo_voltage_min", on_change=sync_algo_to_cfg, args=("algo_voltage_min", "cfg_voltage_min_limit"), disabled=locked)
+        st.number_input("저전압 해제 기준 (p.u.)", value=float(st.session_state["cfg_voltage_low_off"]), step=0.005, key="algo_voltage_low_off", on_change=sync_algo_to_cfg, args=("algo_voltage_low_off", "cfg_voltage_low_off"), disabled=locked)
+        st.number_input("선로용량 한도 (MVA)", value=float(st.session_state["cfg_line_limit_mva"]), step=0.5, key="algo_line_limit", on_change=sync_algo_to_cfg, args=("algo_line_limit", "cfg_line_limit_mva"), disabled=locked)
+        st.number_input("선로 복귀 비율 (0~1)", key="cfg_line_return_ratio", min_value=0.50, max_value=1.0, step=0.01, disabled=locked)
+        st.number_input("OLTC 동작 지연 (분)", value=float(st.session_state["cfg_oltc_delay_mins"]), step=1.0, key="algo_oltc_delay", on_change=sync_algo_to_cfg, args=("algo_oltc_delay", "cfg_oltc_delay_mins"), disabled=locked)
+        st.number_input("OLTC 복귀 지연 (분)", value=float(st.session_state["cfg_oltc_return_delay_mins"]), step=1.0, key="algo_oltc_return", on_change=sync_algo_to_cfg, args=("algo_oltc_return", "cfg_oltc_return_delay_mins"), disabled=locked)
+        st.number_input("ESS 유효전력 이득", key="cfg_ess_p_gain", step=0.5, disabled=locked)
+        st.number_input("ESS 최소 SOC lock (%)", value=float(st.session_state["cfg_ess_min_soc"]), step=1.0, key="algo_ess_min_soc", on_change=sync_algo_to_cfg, args=("algo_ess_min_soc", "cfg_ess_min_soc"), disabled=locked)
+    with col2:
+        st.number_input("전압 상한 (p.u.)", value=float(st.session_state["cfg_voltage_max_limit"]), step=0.01, key="algo_voltage_max", on_change=sync_algo_to_cfg, args=("algo_voltage_max", "cfg_voltage_max_limit"), disabled=locked)
+        st.number_input("과전압 해제 기준 (p.u.)", value=float(st.session_state["cfg_voltage_high_off"]), step=0.005, key="algo_voltage_high_off", on_change=sync_algo_to_cfg, args=("algo_voltage_high_off", "cfg_voltage_high_off"), disabled=locked)
+        st.number_input("선로 혼잡 완화 이득", key="cfg_line_relief_gain", step=0.5, disabled=locked)
+        st.number_input("ESS 무효전력 이득", key="cfg_ess_q_gain", step=0.5, disabled=locked)
+        st.number_input("ESS 램프율 (MW/분)", key="cfg_ess_ramp_rate_mw_per_min", step=0.05, disabled=locked)
+        st.number_input("OLTC 탭당 전압 변동률 (%)", value=float(st.session_state["cfg_oltc_step"]), step=0.05, key="algo_step", on_change=sync_algo_to_cfg, args=("algo_step", "cfg_oltc_step"), disabled=locked)
+        st.number_input("ESS 최대 SOC lock (%)", value=float(st.session_state["cfg_ess_max_soc"]), step=1.0, key="algo_ess_max_soc", on_change=sync_algo_to_cfg, args=("algo_ess_max_soc", "cfg_ess_max_soc"), disabled=locked)
 
 
 def active_ess_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -696,22 +993,24 @@ def display_results():
     )
 
     col1, col2 = st.columns(2)
+    chart_title_suffix = f" ({context.get('label', '')})"
+    
     with col1:
-        st.markdown("##### 모선 전압 프로파일")
+        st.markdown(f"##### 모선 전압 프로파일{chart_title_suffix}")
         fig_v = px.line(results["df_v"], labels={"index": "시간", "value": "Voltage (p.u.)", "variable": "모선"})
         fig_v.add_hline(y=float(st.session_state["cfg_voltage_min_limit"]), line_dash="dash", line_color="red")
         fig_v.add_hline(y=float(st.session_state["cfg_voltage_max_limit"]), line_dash="dash", line_color="red")
         fig_v.update_layout(margin=dict(l=0, r=0, t=20, b=0), hovermode="x unified")
         st.plotly_chart(fig_v, use_container_width=True)
 
-        st.markdown("##### 최대 선로용량 추이")
+        st.markdown(f"##### 최대 선로용량 추이{chart_title_suffix}")
         fig_line = px.line(results["df_line_mva_max"], labels={"index": "시간", "value": "MVA"})
         fig_line.add_hline(y=float(st.session_state["cfg_line_limit_mva"]), line_dash="dash", line_color="red")
         fig_line.update_layout(margin=dict(l=0, r=0, t=20, b=0), hovermode="x unified")
         st.plotly_chart(fig_line, use_container_width=True)
 
     with col2:
-        st.markdown("##### ESS SOC")
+        st.markdown(f"##### ESS SOC{chart_title_suffix}")
         df_soc = active_ess_frame(results["df_soc"])
         if df_soc.empty:
             st.info("활성 ESS가 없습니다.")
@@ -720,7 +1019,7 @@ def display_results():
             fig_soc.update_layout(margin=dict(l=0, r=0, t=20, b=0), hovermode="x unified")
             st.plotly_chart(fig_soc, use_container_width=True)
 
-        st.markdown("##### ESS 유효전력 출력")
+        st.markdown(f"##### ESS 유효전력 출력{chart_title_suffix}")
         df_ess = active_ess_frame(results["df_ess_p"])
         if df_ess.empty:
             st.info("활성 ESS가 없습니다.")
@@ -733,12 +1032,13 @@ def display_results():
     summary_df = pd.concat([results["df_min_v"], results["df_max_v"], results["df_line_mva_max"], results["df_state"]], axis=1)
     st.dataframe(summary_df, use_container_width=True)
     st.download_button(
-        label="상세 결과 엑셀 다운로드",
+        label="현재 표시 시나리오 상세 엑셀 다운로드",
         data=st.session_state["excel_bytes"],
         file_name="simulation_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="download_excel_button",
     )
+    st.caption(f"이 파일은 현재 화면에 표시된 시뮬레이션 1건({context.get('label', '-')})의 상세 시계열 로그입니다.")
 
 
 def display_auto_results():
@@ -746,7 +1046,7 @@ def display_auto_results():
     if not search_result:
         return
 
-    st.header("3. 자동 민감도 분석 결과")
+    st.header("3. 다중 시나리오 분석 결과")
     runs_df = pd.DataFrame(search_result["runs"])
     scenario = search_result.get("scenario")
     if runs_df.empty:
@@ -774,6 +1074,19 @@ def display_auto_results():
         fig_line.update_layout(title="증가 배율에 따른 선로용량 변화")
         st.plotly_chart(fig_line, use_container_width=True)
 
+    chart_col3, chart_col4 = st.columns(2)
+    with chart_col3:
+        plot_soc = runs_df[["sweep_percent", "ess_soc_min_pct", "ess_soc_max_pct"]].melt(id_vars="sweep_percent", var_name="항목", value_name="SOC (%)")
+        fig_soc = px.line(plot_soc, x="sweep_percent", y="SOC (%)", color="항목", markers=True)
+        fig_soc.update_layout(title="증가 배율에 따른 ESS SOC 범위", xaxis_title="증가 배율 (%)", yaxis_title="SOC (%)")
+        st.plotly_chart(fig_soc, use_container_width=True)
+
+    with chart_col4:
+        plot_tap = runs_df[["sweep_percent", "oltc_tap_min", "oltc_tap_max"]].melt(id_vars="sweep_percent", var_name="항목", value_name="Tap Pos")
+        fig_tap = px.line(plot_tap, x="sweep_percent", y="Tap Pos", color="항목", markers=True)
+        fig_tap.update_layout(title="증가 배율에 따른 OLTC 운영 범위", xaxis_title="증가 배율 (%)", yaxis_title="Tap Position")
+        st.plotly_chart(fig_tap, use_container_width=True)
+
     display_cols = [
         "sweep_percent", "load_scale", "renewable_scale", "min_voltage", "max_voltage", "max_line_mva",
         "load_total_min_mw", "load_total_max_mw", "pv_total_min_mw", "pv_total_max_mw", "wind_total_min_mw", "wind_total_max_mw",
@@ -793,12 +1106,22 @@ def display_auto_results():
         st.success("설정한 증가 범위 내에서는 전압 및 선로용량 기준을 모두 만족했습니다.")
 
     if st.session_state.get("auto_report_bytes"):
+        st.info("💡 참고: 다운로드한 Word 보고서에 그래프가 누락된 경우, 설치 환경에 `matplotlib` 및 `kaleido` 패키지가 필요합니다.")
         st.download_button(
-            label="분석 보고서 다운로드 (.docx)",
+            label="Word report download",
             data=st.session_state["auto_report_bytes"],
             file_name=st.session_state.get("auto_report_name", "simulation_report.docx"),
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             key="download_word_report",
+        )
+
+    if st.session_state.get("auto_excel_bytes"):
+        st.download_button(
+            label="모든 시나리오 상세 로그 엑셀 다운로드",
+            data=st.session_state["auto_excel_bytes"],
+            file_name=f"all_scenarios_{search_result.get('scenario')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_all_excel",
         )
 
 
@@ -845,6 +1168,16 @@ def display_batch_results():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_batch_excel",
             )
+    if st.session_state.get("batch_detailed_excel_bytes"):
+        st.download_button(
+            label="Batch 전체 시나리오 상세 로그 엑셀 다운로드",
+            data=st.session_state["batch_detailed_excel_bytes"],
+            file_name=f"{st.session_state.get('batch_summary_prefix', 'batch_summary')}_detailed.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_batch_detailed_excel",
+        )
+    elif not batch_result.get("detailed_outputs"):
+        st.caption("전체 시나리오 상세 로그가 필요하면 실행 전에 `Store Detailed Outputs` 옵션을 켜주세요.")
 
 def run_single_scenario(config):
     # 현재 설정값으로 24시간 단일 시나리오를 1회 수행한다.
@@ -888,7 +1221,7 @@ def run_auto_scenario(config):
         st.error("증가 간격은 0보다 커야 합니다.")
         return
 
-    progress = st.progress(0, text="자동 민감도 분석 초기화 중...")
+    progress = st.progress(0, text="다중 시나리오 분석 초기화 중...")
     try:
         estimated_runs = max(1, int(math.floor((max_scale - start_scale) / step_scale)) + 1)
 
@@ -927,7 +1260,10 @@ def run_auto_scenario(config):
             st.session_state["sim_events"] = search_result["last_events"]
             st.session_state["sim_result_context"] = {"label": f"{scenario_label(scenario)} | 최종 단계 {float(search_result['max_scale']) * 100:.1f}%"}
             st.session_state["excel_bytes"] = build_analysis_excel_bytes(search_result["last_results"])
-        progress.progress(1.0, text="자동 민감도 분석 완료")
+            
+        # 모든 회차를 포함한 통합 엑셀 생성
+        st.session_state["auto_excel_bytes"] = build_all_scenarios_excel_bytes(search_result)
+        progress.progress(1.0, text="다중 시나리오 분석 완료")
     finally:
         st.session_state["is_running"] = False
         st.session_state["active_run_action"] = None
@@ -939,7 +1275,7 @@ def run_batch_scenarios(config):
     batch_settings = build_batch_settings_from_state()
     batch_mode = st.session_state["cfg_batch_mode"]
     try:
-        scenarios = generate_scenarios(batch_mode, batch_settings)
+        scenarios = generate_scenarios(batch_mode, batch_settings, bus_count=len(st.session_state.get("bus_df", [])))
     except Exception as exc:
         st.error(f"배치 시나리오 생성 오류: {exc}")
         st.session_state["is_running"] = False
@@ -955,6 +1291,7 @@ def run_batch_scenarios(config):
     st.session_state["batch_result"] = None
     st.session_state["batch_summary_csv_bytes"] = None
     st.session_state["batch_summary_excel_bytes"] = None
+    st.session_state["batch_detailed_excel_bytes"] = None
     progress = st.progress(0, text="Batch scenario execution: preparing...")
     try:
         def _batch_progress(completed, total, scenario_id):
@@ -976,6 +1313,8 @@ def run_batch_scenarios(config):
         st.session_state["batch_result"] = batch_result
         st.session_state["batch_summary_csv_bytes"] = build_batch_summary_csv_bytes(batch_result)
         st.session_state["batch_summary_excel_bytes"] = build_batch_summary_excel_bytes(batch_result)
+        if batch_result.get("detailed_outputs"):
+            st.session_state["batch_detailed_excel_bytes"] = build_batch_detailed_excel_bytes(batch_result)
         st.session_state["batch_summary_prefix"] = f"batch_{batch_mode}_summary"
         progress.progress(1.0, text=f"{scenario_mode_label(batch_mode)} batch complete")
     finally:
@@ -986,24 +1325,36 @@ def main():
     init_session_state()
     apply_pending_config_updates()
     recover_interrupted_run_state()
+    normalize_bus_selection_state()
     config = build_sidebar_config()
     locked = st.session_state.get("is_running", False)
 
     render_run_controls()
     display_bus_df = prepare_single_ess_bus_df(st.session_state["bus_df"], config)
 
-    tab_model, tab_profile, tab_algo = st.tabs(["계통 모델", "시계열 패턴", "협조제어 알고리즘"])
+    tab_model, tab_profile, tab_algo = st.tabs(["계통 모델", "시계열 패턴", "ESS-OLTC 운영 알고리즘"])
 
     with tab_model:
         st.subheader("기본 계통 모델")
-        st.caption("OLTC는 변전소 1대, ESS는 선택한 버스에 1대만 배치됩니다.")
-        if st.button("권장 기본값 적용", key="apply_recommended_case", disabled=locked):
+        st.caption("OLTC는 변전소 1대, ESS는 선택한 버스에 1대만 배치되며, 좌측 사이드바 '동적 모선 규모 / 선로 길이 설정'에서 모선(Bus)의 개수를 동적으로 증감할 수 있습니다.")
+        if st.button("권장 기본값 적용(Bus 5개)", key="apply_recommended_case", disabled=locked):
             apply_recommended_base_case()
-        edited_df_bus = st.data_editor(editable_bus_dataframe(st.session_state["bus_df"]), hide_index=True, width="stretch", key="bus_editor", disabled=locked)
+            st.rerun()
+        edited_df_bus = st.data_editor(
+            editable_bus_dataframe(st.session_state["bus_df"]),
+            hide_index=True,
+            width="stretch",
+            key="bus_editor",
+            disabled=locked,
+        )
         merge_bus_editor(edited_df_bus)
         display_bus_df = prepare_single_ess_bus_df(st.session_state["bus_df"], config)
-        ess_row = display_bus_df.iloc[int(st.session_state["cfg_ess_bus_number"]) - 1]
-        st.write(f"ESS 설치 위치: Bus {int(st.session_state['cfg_ess_bus_number'])} | 정격출력 {float(ess_row['ESS_최대출력']):.2f} MW | 에너지용량 {float(ess_row['ESS_용량']):.2f} MWh")
+        ess_bus_idx = int(st.session_state["cfg_ess_bus_number"]) - 1
+        if 0 <= ess_bus_idx < len(display_bus_df):
+            ess_row = display_bus_df.iloc[ess_bus_idx]
+            st.write(f"ESS 설치 위치: Bus {int(st.session_state['cfg_ess_bus_number'])} | 정격출력 {float(ess_row['ESS_최대출력']):.2f} MW | 에너지용량 {float(ess_row['ESS_용량']):.2f} MWh")
+        else:
+            st.write(f"ESS 설치 위치: Bus {int(st.session_state['cfg_ess_bus_number'])} (지정된 모선 규모 내에 없습니다. 사이드바에서 ESS 위치를 변경해주세요.)")
         render_topology(display_bus_df)
 
     with tab_profile:
@@ -1017,12 +1368,14 @@ def main():
     with tab_algo:
         render_algorithm_tab()
 
-    st.caption("자동 민감도 분석 실행은 시작 배율부터 최대 배율까지 단계별로 다수의 시뮬레이션을 반복 수행합니다.")
+    st.caption("다중 시나리오 분석 실행은 시작 배율부터 최대 배율까지 단계별로 다수의 시뮬레이션을 반복 수행합니다.")
+    autosave_user_config_if_needed()
+
     b1, b2 = st.columns(2)
     with b1:
         run_single = st.button("단일 시나리오 실행", type="primary", key="run_button", disabled=locked)
     with b2:
-        run_auto = st.button("자동 민감도 분석 실행", type="primary", key="run_auto_button", disabled=locked)
+        run_auto = st.button("다중 시나리오 분석 실행", type="primary", key="run_auto_button", disabled=locked)
 
     run_batch = render_batch_mode_panel(locked)
 
@@ -1042,7 +1395,7 @@ def main():
             st.info("시뮬레이션 실행 중입니다. 실행이 완료될 때까지 설정 변경은 잠금됩니다.")
             run_single_scenario(config)
         elif requested_action == "auto":
-            st.info("자동 민감도 분석 실행 중입니다. 실행이 완료될 때까지 설정 변경은 잠금됩니다.")
+            st.info("다중 시나리오 분석 실행 중입니다. 실행이 완료될 때까지 설정 변경은 잠금됩니다.")
             run_auto_scenario(config)
         elif requested_action == "batch":
             st.info("배치 시나리오 실행 중입니다. 실행이 완료될 때까지 설정 변경은 잠금됩니다.")
@@ -1053,16 +1406,12 @@ def main():
     display_batch_results()
 
 
-main()
-
 if __name__ == "__main__":
+    import sys
+    import subprocess
     from streamlit import runtime
 
     if not runtime.exists():
         subprocess.run([sys.executable, "-m", "streamlit", "run", sys.argv[0]])
-
-
-
-
-
-
+    else:
+        main()
